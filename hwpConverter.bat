@@ -13,7 +13,7 @@ set "CP=%JAR%;%LIB%"
 
 where java >nul 2>nul
 if errorlevel 1 (
-    echo [ERROR] Java not found on PATH. Please install Java 11+ and retry.
+    echo [ERROR] Java not found on PATH. Please install Java 8+ and retry.
     exit /b 1
 )
 

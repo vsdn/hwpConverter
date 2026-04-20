@@ -522,11 +522,23 @@ public class HwpConverter {
     //  배치(다건) 모드 지원
     // ==========================================================
 
-    /** 배치 결과 집계용 */
-    private static final class BatchResult {
-        int ok = 0;
-        int fail = 0;
-        final java.util.List<String> failDetails = new java.util.ArrayList<>();
+    /**
+     * 배치 변환 결과 집계.
+     *
+     * <p>라이브러리 사용자가 성공/실패 건수와 실패 목록을 조회할 수 있도록 public 으로 공개.
+     * 필드 접근과 getter 를 모두 지원한다 (읽기 전용 스냅샷으로 간주).
+     */
+    public static final class BatchResult {
+        /** 변환 성공 건수 */
+        public int ok = 0;
+        /** 변환 실패 건수 (SKIP 은 여기 포함되지 않음) */
+        public int fail = 0;
+        /** 실패한 파일별 상세 메시지 ("파일명 : 원인" 형식) */
+        public final java.util.List<String> failDetails = new java.util.ArrayList<>();
+
+        public int getOk()                               { return ok; }
+        public int getFail()                             { return fail; }
+        public java.util.List<String> getFailDetails()   { return failDetails; }
     }
 
     /** 주어진 디렉터리에서 확장자(소문자)가 일치하는 파일만 비재귀적으로 수집 */
