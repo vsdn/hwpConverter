@@ -10,6 +10,8 @@ HWP · HWPX 양방향 변환기와 한글 배포용(DRM) 문서 변환기.
 
 CLI로도 지원하고 라이브러리로도 지원합니다.
 
+문의 혹은 버그 리포트는 cowork@nsoftware.kr 로 전달바랍니다.
+
 ## 요구사항
 
 - **Java 8 이상** (`javac --release 8` 타겟)
