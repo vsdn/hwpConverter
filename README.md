@@ -48,13 +48,15 @@ chmod +x release/hwpConverter.sh   # 최초 1회
 
 | 작업 | 명령 |
 |------|------|
-| HWPX → HWP | `hwpConverter <in.hwpx> <out.hwp>` |
-| HWP → HWPX | `hwpConverter <in.hwp> <out.hwpx>` |
-| 배포용(DRM) | `hwpConverter --dist <in.hwp> <out.hwp> <password> [--no-copy] [--no-print]` |
-| 폴더 배치 | `hwpConverter <inputDir> <outputDir> [--to-hwpx\|--to-hwp]` |
-| 파일 지정 | `hwpConverter <f1> <f2> ... <outputDir> --to-hwpx\|--to-hwp` |
+| HWPX → HWP | `hwpConverter.bat <in.hwpx> <out.hwp>` |
+| HWP → HWPX | `hwpConverter.bat <in.hwp> <out.hwpx>` |
+| 배포용(DRM) | `hwpConverter.bat --dist <in.hwp> <out.hwp> <password> [--no-copy] [--no-print]` |
+| 폴더 배치 | `hwpConverter.bat <inputDir> <outputDir> [--to-hwpx\|--to-hwp]` |
+| 파일 지정 | `hwpConverter.bat <f1> <f2> ... <outputDir> --to-hwpx\|--to-hwp]` |
+| 배포용 다건변경 (DRM) | `hwpConverter.bat --dist <f1> <f2> ... <outputDir> <password> [--no-copy] [--no-print] [--out-hwpx\--out-hwp]` |
 
 경로·암호에 공백이나 셸 특수문자(`< > & |`) 가 있으면 반드시 따옴표로 감싸세요.
+
 
 ## 라이브러리로 사용하기
 
@@ -80,14 +82,14 @@ java  -cp "hwpConverter.jar:lib/*:." MyApp
 ```bash
 mvn install:install-file -Dfile=hwpConverter.jar \
     -DgroupId=kr.n.nframe -DartifactId=hwpConverter \
-    -Dversion=1.0 -Dpackaging=jar
+    -Dversion=13.15 -Dpackaging=jar
 ```
 
 ```xml
 <dependency>
     <groupId>kr.n.nframe</groupId>
     <artifactId>hwpConverter</artifactId>
-    <version>1.0</version>
+    <version>13.15</version>
 </dependency>
 
 <!-- 외부 의존성 (lib/ 에 포함된 것들) -->
@@ -216,7 +218,7 @@ public class HwpConverter {
 }
 ```
 
-`BatchResult` 는 public static 내부 클래스로 다음 필드·getter 를 제공합니다:
+`BatchResult` 는 public static 내부 클래스로 다음 필드·getter 를 제공합니다 (v13.11 부터):
 
 ```java
 HwpConverter.BatchResult r = converter.batchHwpxToHwp("in_dir", "out_dir");
@@ -241,7 +243,6 @@ src/kr/n/nframe/
     └── writer/    (HwpWriter, SectionWriter, DocInfoWriter,
                     DistributionWriter, HwpxPostProcessor, HwpxXmlRewriter)
 ```
-
 
 ## 라이선스
 Apache License 2.0 — [LICENSE](LICENSE) 참조.

@@ -109,10 +109,10 @@ public final class HwpxXmlRewriter {
 
     /** ZIP 엔트리 최대 개수. */
     private static final int MAX_ENTRIES = 10_000;
-    /** 단일 엔트리 최대 크기. */
-    private static final long MAX_ENTRY_BYTES = 64L * 1024 * 1024;
+    /** 단일 엔트리 최대 크기 (section0.xml 이 140MB+ 일 수 있음 → 512MB). */
+    private static final long MAX_ENTRY_BYTES = 512L * 1024 * 1024;
     /** 모든 엔트리 누적 최대 크기. */
-    private static final long MAX_TOTAL_BYTES = 256L * 1024 * 1024;
+    private static final long MAX_TOTAL_BYTES = 2L * 1024 * 1024 * 1024;
 
     private static void rewriteUnchecked(String path, List<Integer> astralCodePoints,
                                          List<int[]> tabSettings) throws IOException {

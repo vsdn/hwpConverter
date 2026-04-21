@@ -31,8 +31,6 @@ public class HwpxReader {
     private static final long MAX_BINDATA_BYTES = 64L * 1024 * 1024;
     /** 모든 BinData 엔트리 합계 최대 크기. */
     private static final long MAX_TOTAL_BINDATA_BYTES = 256L * 1024 * 1024;
-    /** 단일 XML 엔트리 최대 크기(압축 해제 후). */
-    private static final long MAX_XML_BYTES = 64L * 1024 * 1024;
     /** ZIP 아카이브 내 엔트리 최대 개수. */
     private static final int MAX_ZIP_ENTRIES = 10_000;
 
@@ -312,11 +310,14 @@ public class HwpxReader {
 
     /**
      * ZIP 항목을 XML 문서로 파싱.
-     * 압축 해제 후 크기가 {@link #MAX_XML_BYTES} 를 초과하면 예외.
+     * 스트림 크기 제한 없음 — 이전 버전에 존재했던 BoundedInputStream (64 MB 상한)은
+     * 이미지/표가 많은 10 MB+ HWPX 파일의 section0.xml 이 압축 해제 시 100 MB+ 로
+     * 팽창하면 "Stream exceeds limit (67108864 bytes)" IOException 을 유발했다.
+     * 메모리 상한은 JVM 힙(-Xmx4g, bat 파일에 고정)으로 제어한다.
      */
     private static Document parseXml(ZipFile zip, ZipEntry entry, DocumentBuilder db)
             throws Exception {
-        try (InputStream is = new BoundedInputStream(zip.getInputStream(entry), MAX_XML_BYTES)) {
+        try (InputStream is = zip.getInputStream(entry)) {
             return db.parse(is);
         }
     }

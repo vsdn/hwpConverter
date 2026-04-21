@@ -116,12 +116,45 @@ public class HwpConverter {
     public void makeHwpDist(String inputPath, String outputPath,
                             String password, boolean noCopy, boolean noPrint) throws Exception {
         ensureDistinctPaths(inputPath, outputPath);
+        // v13.14: 출력 파일의 부모 디렉터리가 없으면 자동 생성한다.
+        // 기존에는 부모 디렉터리가 없을 때 FileNotFoundException("지정된 경로를
+        // 찾을 수 없습니다") 이 발생해 파일이 생성되지 않는 것처럼 보였다.
+        ensureParentDir(outputPath);
+
+        boolean inputIsHwpx = inputPath.toLowerCase().endsWith(".hwpx");
+        boolean outputIsHwpx = outputPath.toLowerCase().endsWith(".hwpx");
+
+        // v13.14: HWPX 는 HWP 의 DRM(배포용 문서, AES-128 ViewText) 메커니즘을
+        // 지원하지 않는다. 출력 확장자가 .hwpx 이면 DRM 을 건너뛰고 원본의
+        // 내용/양식을 그대로 보존하는 HWPX 를 생성한다.
+        // (이전에는 DistributionWriter 가 .hwpx 경로에도 HWP 바이너리(OLE2,
+        //  d0cf 11e0 ...) 를 그대로 써서 한글 프로그램으로 열 수 없는 손상된
+        //  파일이 만들어졌다. task1(0421) 참조.)
+        if (outputIsHwpx) {
+            System.out.println("[HwpConverter] 주의: HWPX 출력 포맷은 DRM(복사/인쇄 방지)"
+                    + " 을 지원하지 않으므로 보호 옵션이 적용되지 않습니다.");
+            System.out.println("[HwpConverter] 원본 내용 및 양식을 보존하여 HWPX 로 변환합니다.");
+            if (inputIsHwpx) {
+                // HWPX → HWPX: 원본 바이트를 그대로 복사해 내용/양식을 100% 보존한다.
+                java.nio.file.Files.copy(
+                        java.nio.file.Paths.get(inputPath),
+                        java.nio.file.Paths.get(outputPath),
+                        java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                System.out.println("[HwpConverter] Writing HWPX: " + outputPath);
+            } else {
+                // HWP → HWPX: 일반 HWP→HWPX 변환을 사용한다 (DRM 없이).
+                convertHwpToHwpx(inputPath, outputPath);
+            }
+            System.out.println("[HwpConverter] Conversion complete.");
+            return;
+        }
+
         String hwpPath = inputPath;
         java.io.File tmpFile = null;
 
         try {
             // 입력이 HWPX인 경우 우선 HWP로 변환 (임시 파일)
-            if (inputPath.toLowerCase().endsWith(".hwpx")) {
+            if (inputIsHwpx) {
                 hwpPath = outputPath + ".tmp.hwp";
                 tmpFile = new java.io.File(hwpPath);
                 System.out.println("[HwpConverter] Input is HWPX, converting to HWP first...");
@@ -139,6 +172,29 @@ public class HwpConverter {
             if (tmpFile != null) {
                 try { java.nio.file.Files.deleteIfExists(tmpFile.toPath()); }
                 catch (java.io.IOException ignored) {}
+            }
+        }
+    }
+
+    /**
+     * 출력 파일 경로의 부모 디렉터리가 존재하지 않으면 생성한다.
+     * (존재하지만 디렉터리가 아니면 예외).
+     */
+    private static void ensureParentDir(String outputPath) throws IOException {
+        if (outputPath == null) return;
+        java.io.File out = new java.io.File(outputPath);
+        java.io.File parent = out.getAbsoluteFile().getParentFile();
+        if (parent == null) return;
+        if (parent.exists()) {
+            if (!parent.isDirectory()) {
+                throw new IOException("출력 경로의 부모가 디렉터리가 아닙니다: " + parent);
+            }
+            return;
+        }
+        if (!parent.mkdirs()) {
+            // 혹시 경쟁 생성으로 방금 존재하게 되었는지 재확인
+            if (!parent.isDirectory()) {
+                throw new IOException("출력 디렉터리 생성 실패: " + parent);
             }
         }
     }
@@ -872,13 +928,45 @@ public class HwpConverter {
             java.util.List<String> positional = new java.util.ArrayList<>();
             boolean noCopy = false, noPrint = false;
             String forceOutExt = null; // 배치 모드 전용: 출력 확장자 강제
+            // --to-hwpx / --to-hwp 가 --dist 와 함께 지정된 경우:
+            //   · 폴더 입력 → --dist 를 무시하고 일반 폴더 배치 변환으로 라우팅
+            //   · 파일 입력 → --out-hwpx / --out-hwp 와 동일하게 취급 (forceOutExt 설정)
+            String toModeFromDist = null; // "hwp2hwpx" or "hwpx2hwp" (null = not specified)
             for (int i = 1; i < args.length; i++) {
                 String a = args[i];
-                if ("--no-copy".equals(a)) { noCopy = true; continue; }
+                if ("--no-copy".equals(a))  { noCopy = true; continue; }
                 if ("--no-print".equals(a)) { noPrint = true; continue; }
                 if ("--out-hwpx".equals(a)) { forceOutExt = ".hwpx"; continue; }
                 if ("--out-hwp".equals(a))  { forceOutExt = ".hwp";  continue; }
+                if ("--to-hwpx".equals(a))  { toModeFromDist = "hwp2hwpx"; continue; }
+                if ("--to-hwp".equals(a))   { toModeFromDist = "hwpx2hwp"; continue; }
                 positional.add(a);
+            }
+
+            // --to-hwpx / --to-hwp + 폴더 입력 → 일반 폴더 배치 변환 (--dist 무시)
+            // 이 경우 사용자가 --dist 를 실수로 앞에 붙인 것으로 간주한다.
+            if (toModeFromDist != null && positional.size() >= 1) {
+                java.io.File firstIn = new java.io.File(positional.get(0));
+                if (firstIn.isDirectory()) {
+                    if (positional.size() < 2) {
+                        System.err.println("[오류] 출력 디렉터리를 지정해야 합니다.");
+                        System.exit(2); return;
+                    }
+                    System.out.println("[HwpConverter] --dist 와 --to-" +
+                            ("hwp2hwpx".equals(toModeFromDist) ? "hwpx" : "hwp") +
+                            " 가 함께 지정되었습니다. 일반 폴더 배치 변환으로 처리합니다.");
+                    BatchResult br;
+                    if ("hwp2hwpx".equals(toModeFromDist))
+                        br = converter.batchHwpToHwpx(positional.get(0), positional.get(1));
+                    else
+                        br = converter.batchHwpxToHwp(positional.get(0), positional.get(1));
+                    if (br.fail > 0) System.exit(3);
+                    return;
+                }
+                // 파일 입력이면 --to-hwpx/--to-hwp 를 --out-hwpx/--out-hwp 와 동일하게 취급
+                if (forceOutExt == null) {
+                    forceOutExt = "hwp2hwpx".equals(toModeFromDist) ? ".hwpx" : ".hwp";
+                }
             }
 
             // 다건(폴더): 첫 번째 위치 인자가 디렉터리인 경우
