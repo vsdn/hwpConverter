@@ -57,6 +57,34 @@ public class SectionWriter {
      */
     private static void writeParagraph(ByteArrayOutputStream out, Paragraph para, int level,
                                        boolean inCell, boolean lastInList) throws IOException {
+        // PARA_CHAR_SHAPE / PARA_LINE_SEG 정합성 보정 — PARA_HEADER 작성 전에 수행해야
+        // PARA_HEADER 의 charShapeCount / lineSegCount 가 실제 후속 record 와 일치한다.
+        // hwp2hwpx ForPara.runs(...) NPE 와 한/글 "파일 손상" 거부의 직접 원인이었다.
+        if (para.charShapeRefs.isEmpty()) {
+            CharShapeRef defaultRef = new CharShapeRef();
+            defaultRef.position = 0;
+            defaultRef.charShapeId = 0;
+            para.charShapeRefs.add(defaultRef);
+        }
+        if (para.lineSegs.isEmpty()) {
+            LineSeg defaultSeg = new LineSeg();
+            defaultSeg.textStartPos = 0;
+            defaultSeg.lineVertPos = 0;
+            defaultSeg.lineHeight = 1000;
+            defaultSeg.textHeight = 1000;
+            defaultSeg.baselineDistance = 600;
+            defaultSeg.lineSpacing = 0;
+            defaultSeg.columnStartPos = 0;
+            defaultSeg.segWidth = 0;
+            defaultSeg.tag = 0;
+            para.lineSegs.add(defaultSeg);
+        }
+        // 안전 가드: 퇴화 seg(segWidth/lineHeight<=0)는 한컴 layout 재계산 시 위험.
+        for (LineSeg seg : para.lineSegs) {
+            if (seg.segWidth <= 0) seg.segWidth = 42000;
+            if (seg.lineHeight <= 0) seg.lineHeight = 1000;
+        }
+
         // PARA_HEADER
         out.write(buildParaHeader(para, level, inCell, lastInList));
 
@@ -70,15 +98,11 @@ public class SectionWriter {
             out.write(RecordWriter.buildRecord(HwpTagId.PARA_TEXT, level + 1, para.paraText.rawBytes));
         }
 
-        // PARA_CHAR_SHAPE: 항목이 존재하면 작성 (빈 문단도 참조본에 있음)
-        if (!para.charShapeRefs.isEmpty()) {
-            out.write(buildParaCharShape(para.charShapeRefs, level + 1));
-        }
+        // PARA_CHAR_SHAPE — 보정은 메서드 상단에서 이미 수행됨 (PARA_HEADER 정합성 위해).
+        out.write(buildParaCharShape(para.charShapeRefs, level + 1));
 
-        // PARA_LINE_SEG: 항목이 존재하면 작성
-        if (!para.lineSegs.isEmpty()) {
-            out.write(buildParaLineSeg(para.lineSegs, level + 1));
-        }
+        // PARA_LINE_SEG — 보정은 메서드 상단에서 이미 수행됨.
+        out.write(buildParaLineSeg(para.lineSegs, level + 1));
 
         // PARA_RANGE_TAG: PARA_LINE_SEG 뒤에 기록 (한컴 참조 순서와 동일:
         //   HEADER, TEXT, CHAR_SHAPE, LINE_SEG, RANGE_TAG, 컨트롤...).
@@ -126,9 +150,12 @@ public class SectionWriter {
 
         if (!hasText) {
             // 빈 문단: nChars=1 (암시적 문단 개행), controlMask=0
+            // v15.6: instanceId override 제거. parseParagraph 가 HWPML id 속성
+            // 으로부터 정확한 값을 이미 채워뒀으므로 그대로 신뢰한다.
+            //   이전 (~v15.5) 코드는 빈 문단 instanceId 를 0x80000000 으로 강제해
+            //   한/글 원본 (대부분 0) 과 30+ byte 위치에서 mismatch 발생.
             nChars = 1;
             controlMask = 0;
-            instanceId = 0x80000000L;
         }
 
         // nChars bit 31 = "lastInList" 플래그.
@@ -267,19 +294,25 @@ public class SectionWriter {
     // --- CtrlSectionDef ---
 
     /**
-     * 섹션 정의용 CTRL_HEADER: 총 47 byte.
+     * 섹션 정의용 CTRL_HEADER: 총 38 byte.
      *
      * ctrlId(4) + property(4) + columnGap(2) + vertGrid(2) + horizGrid(2) +
      * defaultTabStop(4) + numberingParaShapeId(2) + pageNumber(2) + figNumber(2) +
      * tableNumber(2) + equationNumber(2) + defaultLang(2) = 30 byte
-     * + 버전 5.0.1.5+ 호환성을 위한 17 byte 0 패딩 = 47 byte
+     * + 버전 5.0.1.2+ 호환성을 위한 8 byte 0 패딩 = 38 byte
+     *
+     * <p>v16.00 수정 (newfeature deep diff): 이전 47 byte (17 byte 패딩) 출력은
+     *   사양 위반으로 한/글이 "파일이 손상되었습니다" 팝업을 띄움. 참조본 v47.hwp 와
+     *   hwplib-1.1.10 의 ForControlSectionDefine.ctrlHeader 가 모두 8 byte 패딩 = 38 byte.
+     *   기존 17 byte 패딩 출력에 의존하는 다운스트림 reader 는 없음 (한/글, hwplib reader
+     *   모두 38 byte 본문을 표준으로 인식).
      *
      * 참조본 byte 18 (ctrlId 시작부터의 offset) = outlineShapeIDRef (UINT16), 값=1.
      * 이는 numberingParaShapeId 위치에 해당한다.
      */
     private static void writeSectionDef(ByteArrayOutputStream out, CtrlSectionDef sd, int level)
             throws IOException {
-        HwpBinaryWriter w = new HwpBinaryWriter(48);
+        HwpBinaryWriter w = new HwpBinaryWriter(40);
         w.writeUInt32(sd.ctrlId);              // 4 byte
         w.writeUInt32(sd.property);            // 4 byte
         w.writeHwpUnit16(sd.columnGap);        // 2 byte
@@ -293,8 +326,8 @@ public class SectionWriter {
         w.writeUInt16(sd.equationNumber);      // 2 byte
         w.writeUInt16(sd.defaultLang);         // 2 byte
         // --- 여기까지 30 byte ---
-        w.writePad(17);                        // 17 byte 0 패딩
-        // --- 총 47 byte ---
+        w.writePad(8);                         // 8 byte 0 패딩 (사양상 정확)
+        // --- 총 38 byte ---
         out.write(RecordWriter.buildRecord(HwpTagId.CTRL_HEADER, level, w.toByteArray()));
 
         // CTRL_DATA는 여기에 작성하지 않음 - 일부 참조 파일에만 존재하며
@@ -500,6 +533,18 @@ public class SectionWriter {
      */
     private static void writeTableCell(ByteArrayOutputStream out, TableCell cell, int level)
             throws IOException {
+        // v14.4: 한/글 프로그램은 표 셀의 paragraphCount=0 LIST_HEADER 를 거부하고
+        // "파일 손상" 으로 처리한다. 셀에 paragraph 가 없으면 안전한 빈 paragraph
+        // 1 개를 자동 보정 — paragraph 자체는 writeParagraph 안에서 다시 빈
+        // CHAR_SHAPE/LINE_SEG 보정을 받게 된다.
+        if (cell.paragraphs.isEmpty()) {
+            Paragraph emptyP = new Paragraph();
+            emptyP.nChars = 1;       // 빈 paragraph 도 0x0D para end 1자
+            emptyP.paraShapeId = 0;
+            emptyP.styleId = 0;
+            cell.paragraphs.add(emptyP);
+        }
+
         HwpBinaryWriter w = new HwpBinaryWriter(48);
 
         // hwplib 기준 list header base (8 byte): readSInt4 + readUInt4
@@ -518,8 +563,12 @@ public class SectionWriter {
         }
         w.writeUInt16(cell.borderFillId);        // 2 byte
 
-        // 추가 버전 필드 (13 byte)
-        w.writeHwpUnit(cell.width);              // 4 byte: width 복사본
+        // v15.6: 추가 버전 필드 — 셀 내부 텍스트 영역 폭 (textWidth).
+        //   이전 코드는 cell.width 를 다시 쓰는 "복사본" 으로 잘못 처리.
+        //   hwplib ForCell.listHeader 분석 + 한/글 원본 byte 비교 결과,
+        //   이 4 byte 는 subList textWidth (cell width 와 다른 값) 임을 확인.
+        //   parseTableCell 이 이미 cell.textWidth 에 채워 두므로 그대로 사용.
+        w.writeHwpUnit(cell.textWidth > 0 ? cell.textWidth : cell.width);
         w.writePad(9);                           // 9 byte: 0 패딩
         // 총합: 8 + 26 + 13 = 47 byte
 
@@ -607,10 +656,24 @@ public class SectionWriter {
         sw.writeHwpUnit(initH);            // 4: initialHeight (원본 크기)
         sw.writeHwpUnit(curW);             // 4: currentWidth (표시 크기)
         sw.writeHwpUnit(curH);             // 4: currentHeight (표시 크기)
-        // property: 스케일링 된 그림은 bit 19, 일부 플래그는 bit 29
+        // SHAPE_COMPONENT property — shape type 마다 값이 다름.
+        //   $pic (그림): 한/글 참조본 byte 비교 시 0x24080000 — bits 19/26/29.
+        //   $rec (사각형): 한/글 참조본 0x01090000 — bits 16/19/24.
+        //   bit 19 = RotateWithImage (hwplib BitFlag 검증). 다른 비트들은 한컴
+        //   문서에 없으나 한/글이 shape 별 유효 비트를 strict 검증하는 것으로
+        //   보임 (v15.7 rect 좌표를 ref 와 동일하게 맞춰도 거부 → property 가
+        //   $pic 패턴이라 mismatch). $rec 일 때 0x01090000 으로 분기.
         long scProp = 0;
-        if (initW != curW || initH != curH) {
-            scProp = 0x24080000L; // 스케일링 된 그림의 참조본에서 관측됨
+        boolean scaled = (initW != curW) || (initH != curH);
+        if (scaled) {
+            if ("rect".equals(pic.shapeType)) {
+                scProp = 0x01090000L;
+            } else if ("pic".equals(pic.shapeType) || pic.shapeType == null) {
+                scProp = 0x24080000L;
+            } else {
+                // line / ellipse / arc / polygon / curve — 기본적으로 rect 와 동일 패턴
+                scProp = 0x01090000L;
+            }
         }
         sw.writeUInt32(scProp);            // 4: property (flip/scale 플래그)
         sw.writeUInt16(0);                 // 2: 회전 각도 (도)
@@ -644,10 +707,42 @@ public class SectionWriter {
             writeDouble(sw, 0.0); writeDouble(sw, 1.0); writeDouble(sw, 0.0);
         }
 
+        // v13.40: 그리기 개체 (rect/line/ellipse/arc/polygon/curve) 는 SHAPE_COMPONENT 레코드
+        // 안에 LineInfo + FillInfo 를 추가 포함해야 한다. 누락 시 hwplib 파서가 lineInfo=null
+        // 로 읽어 hwp2hwpx.ForDrawingObject.lineShape() 에서 NPE 발생.
+        // (참조: hwplib ForShapeComponentForNormal.write(): gsoId -> CommonPart -> lineInfo(13)
+        //         -> fillInfo(변동, type=0 이면 8) -> shadowInfo(22, null 가능) -> rest)
+        //
+        // v15.5: ShadowInfo(22 byte) 도 반드시 기록해야 한다. 한/글이 생성한 참조본 HWP 의
+        // SHAPE_COMPONENT 와 byte 비교 결과, 우리 출력은 22 byte 짧았고 그 만큼이
+        // ShadowInfo 영역이었음. hwplib 는 null shadow 를 허용하지만 한/글은 "파일이
+        // 손상되었습니다." 로 거부 — 입찰공고문 손상 회귀의 진짜 원인. (참조본 size=239
+        // = LineInfo 13 + FillInfo 8 + ShadowInfo 22 + 나머지 196 byte;
+        //  우리 v15.4 size=217 = ShadowInfo 22 byte 누락)
+        boolean isDrawingShape = pic.shapeType != null && !"pic".equals(pic.shapeType);
+        if (isDrawingShape) {
+            // LineInfo (13 byte) — 기본 검은 0.5mm 실선
+            sw.writeUInt32(0x00000000L); // color: 검정 RGBA 0
+            sw.writeInt32(50);           // thickness: HWPUNIT 50 (약 0.18mm, 기본 얇은 선)
+            sw.writeUInt32(0);           // property (선 유형·끝 모양·화살 등 플래그, 기본 0)
+            sw.writeUInt8(0);            // outlineStyle: 0 = SOLID
+            // FillInfo (8 byte) — type=0 (채움 없음) + 4 zero-pad
+            sw.writeUInt32(0);           // type = NULL (채움 없음)
+            sw.writeUInt32(0);           // 4 byte zero padding (type==0 branch)
+            // ShadowInfo (22 byte) — 그림자 없음 (모든 필드 0)
+            // 구조: BYTE shadowType(1) + COLORREF color(4) + INT32 offsetX(4) + INT32 offsetY(4)
+            //       + UINT8 alpha(1) + 8 byte 패딩 = 22 byte
+            sw.writePad(22);
+        }
+
         out.write(RecordWriter.buildRecord(HwpTagId.SHAPE_COMPONENT, level + 1, sw.toByteArray()));
 
-        // 텍스트박스를 가진 그리기 개체: LIST_HEADER + 문단이 shape 전용 레코드보다 먼저 옴
-        // 참조 순서: SHAPE_COMPONENT -> LIST_HEADER -> 문단 -> SHAPE_COMPONENT_XXX
+        // v15.5: 한/글 참조본의 정확한 순서로 복귀.
+        //   한/글이 생성한 입찰공고문.hwp 와 record 위치를 비교한 결과 (v15.4 의
+        //   추정은 오류였음):
+        //     올바른 순서: SHAPE_COMPONENT → LIST_HEADER(textbox) → 단락 → SHAPE_COMPONENT_RECT
+        //   즉 shape 전용 레코드는 textbox 뒤에 와야 한다. (TABLE 패턴이 아닌
+        //   GenShapeObject 패턴 — hwplib ForRectangle 의 emit 순서와도 일치.)
         if (!pic.textboxParagraphs.isEmpty()) {
             // 텍스트박스 LIST_HEADER 형식 (hwplib ForTextBox 리더와 일치):
             //   INT32 paraCount(4) + UINT32 property(4) +
@@ -672,7 +767,7 @@ public class SectionWriter {
             }
         }
 
-        // Shape 전용 레코드는 level+2에 위치
+        // Shape 전용 레코드는 level+2에 위치 — textbox 다음에 옴
         if ("pic".equals(pic.shapeType) || pic.shapeType == null) {
             // SHAPE_COMPONENT_PICTURE (tag 0x055)
             HwpBinaryWriter pw = new HwpBinaryWriter(128);
@@ -704,11 +799,20 @@ public class SectionWriter {
             pw.writeUInt8(0); // 이미지 투명도
             out.write(RecordWriter.buildRecord(HwpTagId.SHAPE_COMPONENT_PICTURE, level + 2, pw.toByteArray()));
         } else if ("rect".equals(pic.shapeType)) {
-            // SHAPE_COMPONENT_RECTANGLE: cornerRadius(1) + 4 x좌표(16) + 4 y좌표(16) = 33 byte
+            // SHAPE_COMPONENT_RECTANGLE: cornerRadius(1) + 4 x POINT (8byte씩) = 33 byte.
+            //   v15.7: HWP 5.0 spec 의 POINT[4] = (x,y) 쌍 interleave 가 정답.
+            //   이전 v15.6 까지는 X[0..3] 4 개 다음에 Y[0..3] 4 개를 직렬화 → 한/글이
+            //   (0, w) 등 비정상 좌표로 해석 → 사각형이 cross 모양 → "파일이 손상" 거부.
+            //   또한 좌표는 SHAPE_COMPONENT 의 initialWidth/Height (hp:orgSz) 와 동일해야
+            //   한/글이 받아들임. originalWidth/Height 가 0 이면 width/height 로 fallback.
+            int rectW = pic.originalWidth > 0 ? pic.originalWidth : pic.width;
+            int rectH = pic.originalHeight > 0 ? pic.originalHeight : pic.height;
             HwpBinaryWriter pw = new HwpBinaryWriter(64);
             pw.writeUInt8(0); // 모서리 반경 %
-            pw.writeInt32(0); pw.writeInt32(pic.width); pw.writeInt32(pic.width); pw.writeInt32(0); // X 좌표
-            pw.writeInt32(0); pw.writeInt32(0); pw.writeInt32(pic.height); pw.writeInt32(pic.height); // Y 좌표
+            pw.writeInt32(0);     pw.writeInt32(0);      // P0 = (0, 0)
+            pw.writeInt32(rectW); pw.writeInt32(0);      // P1 = (w, 0)
+            pw.writeInt32(rectW); pw.writeInt32(rectH);  // P2 = (w, h)
+            pw.writeInt32(0);     pw.writeInt32(rectH);  // P3 = (0, h)
             out.write(RecordWriter.buildRecord(shapeTag, level + 2, pw.toByteArray()));
         } else if ("line".equals(pic.shapeType)) {
             // SHAPE_COMPONENT_LINE: startX(4)+startY(4)+endX(4)+endY(4)+flags(2) = 18 byte
@@ -755,19 +859,19 @@ public class SectionWriter {
         w.writeUInt32(0);
         out.write(RecordWriter.buildRecord(HwpTagId.CTRL_HEADER, level, w.toByteArray()));
 
-        // 머리말/꼬리말용 LIST_HEADER — 한컴 참조본과 일치시키기 위해 34 byte.
-        // 스펙(표 140 머리말/꼬리말)에는 14 byte의 데이터가 나열되지만,
-        // 한글은 추가 예약/페이지레이아웃 슬롯을 포함한 34 byte 블록으로
-        // 감싼다. 우리가 검사한 모든 한글 생성 HWP에서 추가 18 byte는
-        // 0으로 끝난다.
+        // v15.6: 머리말/꼬리말용 LIST_HEADER (34 byte) — hwplib 의
+        // ForListHeaderForHeaderFooter.write 와 1:1 매핑.
+        //   INT32 paraCount(4) + UINT32 property(4) +
+        //   UINT32 textWidth(4) + UINT32 textHeight(4) + 18 byte zero
+        // 이전 v15.5 까지는 paraCount 를 INT16 으로 쓰고 textRef/numRef byte 를
+        // 끼워넣어 한/글 원본과 모든 필드 offset 이 어긋났다. byte 비교 결과
+        // 524 부터 부터 한/글 입찰공고문.hwp 원본과 mismatch 발생.
         HwpBinaryWriter lw = new HwpBinaryWriter(40);
-        lw.writeInt16(hf.paragraphs.size());
-        lw.writeUInt32(0);                 // listProperty (스펙 "속성")
-        lw.writeHwpUnit(hf.textWidth);     // 텍스트 폭
-        lw.writeHwpUnit(hf.textHeight);    // 텍스트 높이
-        lw.writeUInt8(hf.textRefFlag);
-        lw.writeUInt8(hf.numRefFlag);
-        lw.writePad(18);                   // 예약된 후속 byte
+        lw.writeInt32(hf.paragraphs.size());    // 4 byte: paraCount (INT32)
+        lw.writeUInt32(0);                      // 4 byte: listProperty
+        lw.writeHwpUnit(hf.textWidth);          // 4 byte: textWidth (UINT32)
+        lw.writeHwpUnit(hf.textHeight);         // 4 byte: textHeight (UINT32)
+        lw.writePad(18);                        // 18 byte: 예약 zero
         out.write(RecordWriter.buildRecord(HwpTagId.LIST_HEADER, level + 1, lw.toByteArray()));
 
         // 한컴 참조본에서 문단은 LIST_HEADER의 동급 형제(level+1)이며 —

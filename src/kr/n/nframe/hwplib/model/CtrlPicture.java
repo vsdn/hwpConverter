@@ -70,7 +70,7 @@ public class CtrlPicture extends Control {
     public int textboxMarginTop;
     public int textboxMarginBottom;
     public int textboxLastWidth;
-    public long textboxListProperty;  // bit 21=vertAlign, bit 0-2=textDir, bit 3-4=lineWrap
+    public long textboxListProperty;  // bit 0-2=textDir, bit 3-4=lineWrap, bit 5-6=vertAlign (v15.8 수정: 셀과 동일 layout)
 
     public CtrlPicture() {
         super(CtrlId.GSO);

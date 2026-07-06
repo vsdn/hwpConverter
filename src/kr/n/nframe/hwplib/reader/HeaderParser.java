@@ -971,7 +971,10 @@ public class HeaderParser {
             st.localName      = getAttrStr(stEl, "name", "");
             st.englishName    = getAttrStr(stEl, "engName", "");
             st.nextStyleId    = getAttrInt(stEl, "nextStyleIDRef", 0);
-            st.langId         = getAttrInt(stEl, "langIDRef", 0);
+            // v15.9: HWPX 의 실제 속성명은 "langID" (Ref 접미사 없음).
+            //   잘못된 이름으로 읽어 모든 스타일의 langId 가 0 으로 fallback
+            //   되어 한/글 참조본의 0x0412 (Korean) 와 byte mismatch.
+            st.langId         = getAttrInt(stEl, "langID", 0x0412);
             st.paraShapeId    = getAttrInt(stEl, "paraPrIDRef", 0);
             st.charShapeId    = getAttrInt(stEl, "charPrIDRef", 0);
 

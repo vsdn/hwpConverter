@@ -108,14 +108,34 @@ public final class HwpxPostProcessor {
 
     /**
      * 원본 HWP의 호환성 설정에 따라 한글과 일치하는 정규화를 적용한다.
+     * v16t50 R7: 기존 호출 호환용 — 입력원이 ODT 가 아닌(=원본 HWP) 경로.
      */
     public static void normalize(HWPFile hwp, HWPXFile hwpx) {
+        normalize(hwp, hwpx, false);
+    }
+
+    /**
+     * v16t50 R7: ODT 입력 경로에서는 setAllTablePageBreak(TABLE) 강제 호출을 스킵해
+     * 빌더가 매긴 표별 pageBreak 분포(CELL/NONE/TABLE)를 유지한다.
+     * v15.36 task11 의 인자 어긋남(주석 'NONE 통일' vs 인자 TABLE) 잠복 결함을 본 사이클에서
+     * 회피한다 — MD→HWPX 등 hwp 입력 경로(sourceIsOdt=false)는 종전 동작 그대로 유지.
+     */
+    public static void normalize(HWPFile hwp, HWPXFile hwpx, boolean sourceIsOdt) {
         if (hwpx == null) return;
         CompatibleDocumentSort srcSort = sourceTargetProgram(hwp);
         if (srcSort == CompatibleDocumentSort.HWPCurrent) {
-            applyHwpCurrentProfile(hwpx);
+            applyHwpCurrentProfile(hwpx, sourceIsOdt);
         } else if (srcSort == CompatibleDocumentSort.MSWord) {
-            applyMsWordProfile(hwpx);
+            applyMsWordProfile(hwpx, sourceIsOdt);
+        } else if (sourceIsOdt) {
+            // v16t65 task2/3: ODT 직변환 경로는 builder:106 emitCompatibleDocument=false 라
+            //   임시HWP 에 COMPATIBLE_DOCUMENT 가 없어 srcSort=null → 위 프로파일이 미발화하고
+            //   표 pageBreak 가 hwp2hwpx 기본값 TABLE(한컴 '셀 단위로 나눔') 로 남는다.
+            //   한컴 '나눔' = OWPML "CELL" (서연 역검증 확정: 정답지 hwpx_case1_샘플링.hwpx 가
+            //   CELL 사용 + 사용자 TABLE=셀단위 교차검증) 으로 통일하기 위해 게이트를 우회한다.
+            //   ※ pageBreak 토큰만 CELL 로 덮고 repeatHeader 등 다른 구조는 불변 — 나눔 정답지
+            //   repeatHeader=0 을 보존하고 본문·구조 불변 회귀가드를 지킨다.
+            setAllTablePageBreakOnly(hwpx, TablePageBreak.CELL);
         }
         // HWP2007: 참조 데이터가 없어 의도적으로 건드리지 않는다.
     }
@@ -133,6 +153,10 @@ public final class HwpxPostProcessor {
     // ------------------------------------------------------------------
 
     private static void applyHwpCurrentProfile(HWPXFile hwpx) {
+        applyHwpCurrentProfile(hwpx, false);
+    }
+
+    private static void applyHwpCurrentProfile(HWPXFile hwpx, boolean sourceIsOdt) {
         // HWPCurrent 원본 문서에 대한 프로파일 선택은 1:1이 아니다.
         // 실측 규칙 (한글 12.0.0.535):
         //   · hwp2hwpx가 header.xml에 <hh:memoPr>을 하나 이상 출력하면
@@ -147,7 +171,15 @@ public final class HwpxPostProcessor {
             setCompatibleDocument(hwpx, TargetProgramSort.MS_WORD, LAYOUT_COMPAT_FLAGS);
         }
         fixParaHeadAlignment(hwpx);
-        remapTablePageBreak(hwpx, TablePageBreak.TABLE, TablePageBreak.CELL);
+        // [v15.36 task11] 모든 표의 "여러 쪽 지원" 을 "쪽 경계에서 나눔"
+        //   (= OWPML pageBreak="NONE" = hwplib DivideAtPageBoundary.Divide) 으로 설정.
+        //   HWP/HWPX 출력 모두 동일하게 NONE 으로 통일한다.
+        // v16t50 R7: 주석 의도(NONE) 와 실인자(TABLE) 어긋난 잠복 결함이 ODT 입력에서
+        //   표 잘림으로 노출됨. 진단 결과 hwp2hwpx 라이브러리가 ControlTable.divideAtPageBoundary
+        //   를 무시하고 항상 TABLE 로 매핑하므로, ODT 경로에선 후패치로 CELL 일괄 설정한다.
+        //   MD→HWPX 등 hwp 입력 경로는 종전 TABLE 동작 유지(byte 불변 보장).
+        //   분포(CELL/NONE/TABLE) 미러는 R7-B (v16t51) 에서 진행.
+        setAllTablePageBreak(hwpx, sourceIsOdt ? TablePageBreak.CELL : TablePageBreak.TABLE);
     }
 
     private static boolean hasMemoShapes(HWPXFile hwpx) {
@@ -169,6 +201,10 @@ public final class HwpxPostProcessor {
     // ------------------------------------------------------------------
 
     private static void applyMsWordProfile(HWPXFile hwpx) {
+        applyMsWordProfile(hwpx, false);
+    }
+
+    private static void applyMsWordProfile(HWPXFile hwpx, boolean sourceIsOdt) {
         // targetProgram=MSWord인 HWP 원본은 한글에서 두 가지로 갈린다:
         //   · 메모 모양 있음    → MS_WORD + 35 플래그 + CELL page-break
         //     (예: TA-05_100p — 제목의 "색 채우기 범위"/표 pageBreak가
@@ -178,9 +214,11 @@ public final class HwpxPostProcessor {
         //      사라진다.)
         if (hasMemoShapes(hwpx)) {
             setCompatibleDocument(hwpx, TargetProgramSort.MS_WORD, LAYOUT_COMPAT_FLAGS);
-            remapTablePageBreak(hwpx, TablePageBreak.TABLE, TablePageBreak.CELL);
+            // v16t50 R7: ODT 입력은 CELL 일괄 (hwp2hwpx 가 divideAtPageBoundary 무시 회피).
+            setAllTablePageBreak(hwpx, sourceIsOdt ? TablePageBreak.CELL : TablePageBreak.TABLE);
         } else {
             setCompatibleDocument(hwpx, TargetProgramSort.HWP201X, new String[0]);
+            setAllTablePageBreak(hwpx, sourceIsOdt ? TablePageBreak.CELL : TablePageBreak.TABLE);
         }
     }
 
@@ -266,6 +304,90 @@ public final class HwpxPostProcessor {
                 Tc tc = tr.getTc(c);
                 SubList sub = tc.subList();
                 if (sub != null) visitParaListCore(sub, from, to);
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    //  [v15.28 task3/4] 모든 표의 pageBreak 를 source 값과 무관하게 강제 설정
+    // ------------------------------------------------------------------
+
+    /** [v15.28] 모든 표의 pageBreak 속성을 지정된 값으로 일괄 설정 (nested 표 포함).
+     *  source 값이 TABLE/CELL/NONE 어느 것이든 무조건 target 으로 덮어쓴다. */
+    private static void setAllTablePageBreak(HWPXFile hwpx, TablePageBreak target) {
+        int sections = hwpx.sectionXMLFileList().count();
+        for (int i = 0; i < sections; i++) {
+            forceTablePageBreak(hwpx.sectionXMLFileList().get(i), target);
+        }
+    }
+
+    private static void forceTablePageBreak(ParaListCore list, TablePageBreak target) {
+        int n = list.countOfPara();
+        for (int i = 0; i < n; i++) {
+            Para para = list.getPara(i);
+            int rc = para.countOfRun();
+            for (int r = 0; r < rc; r++) {
+                Run run = para.getRun(r);
+                int ri = run.countOfRunItem();
+                for (int k = 0; k < ri; k++) {
+                    RunItem item = run.getRunItem(k);
+                    if (item instanceof Table) {
+                        Table tbl = (Table) item;
+                        tbl.pageBreak(target);  // 강제 덮어쓰기
+                        // v16t52 T6: golden case1 repeatHeader 전건 1 보존 — ODT/HWP 입력 공통 (false→true).
+                        tbl.repeatHeader(Boolean.TRUE);
+                        int rowCount = tbl.countOfTr();
+                        for (int rr = 0; rr < rowCount; rr++) {
+                            Tr tr = tbl.getTr(rr);
+                            int tcCount = tr.countOfTc();
+                            for (int c = 0; c < tcCount; c++) {
+                                Tc tc = tr.getTc(c);
+                                SubList sub = tc.subList();
+                                if (sub != null) forceTablePageBreak(sub, target);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /** v16t65 task2/3: ODT 경로 표 쪽경계 전용 — pageBreak 토큰만 덮어쓰고
+     *  repeatHeader 등 다른 속성/구조는 일절 건드리지 않는다(나눔 정답지 repeatHeader=0 보존,
+     *  본문·구조 불변 회귀가드). 중첩표(tc.subList) 포함 재귀.
+     *  cf. forceTablePageBreak 는 repeatHeader(TRUE) 까지 강제하므로 ODT 경로엔 부적합. */
+    private static void setAllTablePageBreakOnly(HWPXFile hwpx, TablePageBreak target) {
+        int sections = hwpx.sectionXMLFileList().count();
+        for (int i = 0; i < sections; i++) {
+            forceTablePageBreakOnly(hwpx.sectionXMLFileList().get(i), target);
+        }
+    }
+
+    private static void forceTablePageBreakOnly(ParaListCore list, TablePageBreak target) {
+        int n = list.countOfPara();
+        for (int i = 0; i < n; i++) {
+            Para para = list.getPara(i);
+            int rc = para.countOfRun();
+            for (int r = 0; r < rc; r++) {
+                Run run = para.getRun(r);
+                int ri = run.countOfRunItem();
+                for (int k = 0; k < ri; k++) {
+                    RunItem item = run.getRunItem(k);
+                    if (item instanceof Table) {
+                        Table tbl = (Table) item;
+                        tbl.pageBreak(target);  // pageBreak 토큰만 변경 (repeatHeader 불변)
+                        int rowCount = tbl.countOfTr();
+                        for (int rr = 0; rr < rowCount; rr++) {
+                            Tr tr = tbl.getTr(rr);
+                            int tcCount = tr.countOfTc();
+                            for (int c = 0; c < tcCount; c++) {
+                                Tc tc = tr.getTc(c);
+                                SubList sub = tc.subList();
+                                if (sub != null) forceTablePageBreakOnly(sub, target);
+                            }
+                        }
+                    }
+                }
             }
         }
     }

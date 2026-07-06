@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<title>Markdown 미리보기 (GitHub 스타일)</title>
+<link rel="stylesheet" href="github-markdown.css">
+<style>
+    body {
+        box-sizing: border-box;
+        min-width: 200px;
+        max-width: 980px;
+        margin: 0 auto;
+        padding: 45px;
+        background-color: #ffffff;
+    }
+    @media (prefers-color-scheme: dark) {
+        body { background-color: #0d1117; }
+    }
+    .markdown-body { color-scheme: light dark; }
+</style>
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+</head>
+<body>
+<article class="markdown-body" id="content">불러오는 중…</article>
+
+<script>
+    marked.setOptions({
+        gfm: true,
+        breaks: false,
+        headerIds: true
+    });
+    fetch('sample.md')
+        .then(function(r) { return r.text(); })
+        .then(function(md) {
+            document.getElementById('content').innerHTML = marked.parse(md);
+        })
+        .catch(function(e) {
+            document.getElementById('content').textContent =
+                'sample.md를 불러오지 못했습니다. 로컬에서는 file:// 제한으로 인해 CORS가 차단될 수 있습니다.\n' +
+                '간단한 HTTP 서버를 띄우고 접속하세요: python3 -m http.server 8080';
+        });
+</script>
+</body>
+</html>

@@ -89,11 +89,69 @@ public class SectionParser {
 
         List<Element> pElements = getChildElements(secElement, HP, "p");
         for (Element pEl : pElements) {
+            // v15.8: hp:rect + hp:drawText 의 fallback 처리.
+            //   회귀 분석 결과 SHAPE_COMPONENT/SHAPE_COMPONENT_RECTANGLE 의 byte
+            //   layout 을 한/글 참조본과 byte-identical 로 맞춰도 (v15.7) 한/글이
+            //   계속 "파일이 손상되었습니다" 로 거부 — 알 수 없는 추가 strict
+            //   validation 이 존재. 입찰공고문 의 rect 는 본문 텍스트를 담는
+            //   "테두리 + 표 형태의 글상자" 라 시각적 frame 손실은 허용되지만
+            //   텍스트 내용은 반드시 보존되어야 함. 회귀 안정성을 위해 다음
+            //   휴리스틱을 적용:
+            //     - 문단의 모든 run 이 hp:rect 만 포함 (다른 텍스트/컨트롤 없음)
+            //     - 해당 rect 가 drawText/subList/p 텍스트 본문을 가짐
+            //   → 외곽 carrier 문단을 버리고 drawText 내부 문단들을 section-level
+            //     paragraph 로 emit. 결과적으로 rect frame 없는 일반 텍스트로
+            //     변환되며, rect-specific byte mismatch 가 사라져 한/글 정상 오픈.
+            List<Element> drawTextPs = extractRectDrawTextParagraphsIfCarrierOnly(pEl);
+            if (drawTextPs != null) {
+                for (Element dEl : drawTextPs) {
+                    Paragraph dp = parseParagraph(dEl, doc);
+                    section.paragraphs.add(dp);
+                }
+                continue;
+            }
             Paragraph para = parseParagraph(pEl, doc);
             section.paragraphs.add(para);
         }
 
         return section;
+    }
+
+    /**
+     * hp:p 가 "오직 hp:rect 컨테이너 1 개" 만 포함하고 그 rect 에 drawText 텍스트가
+     * 들어 있는 경우, drawText/subList 의 hp:p 리스트를 반환한다. 그 외에는 null.
+     * 정상 본문이 있는 문단은 영향받지 않는다.
+     */
+    private static List<Element> extractRectDrawTextParagraphsIfCarrierOnly(Element pEl) {
+        List<Element> runs = getChildElements(pEl, HP, "run");
+        if (runs.size() != 1) return null;
+        Element run = runs.get(0);
+        // run 의 children = 정확히 hp:rect 1개 (옵션: 뒤에 빈 hp:t 가 따라올 수 있음).
+        List<Element> runChildren = getAllChildElements(run);
+        Element rectEl = null;
+        for (Element c : runChildren) {
+            String ln = c.getLocalName();
+            if (ln == null) ln = stripNsPrefix(c.getTagName());
+            if ("rect".equals(ln)) {
+                if (rectEl != null) return null; // 두 개 이상 rect — 비표준 carrier 케이스
+                rectEl = c;
+            } else if ("t".equals(ln)) {
+                // 빈 hp:t 는 허용 (rect 뒤의 텍스트 segment 종료자). 비어 있는지 확인.
+                String text = c.getTextContent();
+                if (text != null && !text.isEmpty()) return null;
+            } else {
+                return null; // 다른 컨트롤이나 컨텐츠가 있으면 carrier 가 아님
+            }
+        }
+        if (rectEl == null) return null;
+        Element only = rectEl;
+        Element drawText = getChildElement(only, HP, "drawText");
+        if (drawText == null) return null;
+        Element subList = getChildElement(drawText, HP, "subList");
+        if (subList == null) return null;
+        List<Element> ps = getChildElements(subList, HP, "p");
+        if (ps.isEmpty()) return null;
+        return ps;
     }
 
     /**
@@ -104,9 +162,14 @@ public class SectionParser {
         para.paraShapeId = getAttrInt(pEl, "paraPrIDRef", 0);
         para.styleId     = getAttrInt(pEl, "styleIDRef", 0);
 
-        // instanceId: 참조 파일에서는 대부분의 문단에 0x80000000을 사용
-        // 특정 컨트롤 직후 문단만 0x00000000 사용
-        para.instanceId = 0x80000000L;
+        // v15.6: hp:p 의 'id' 속성을 instanceId 로 사용한다 (HWPML→HWP 직매핑).
+        //   한/글이 만든 입찰공고문.hwp 와 byte 비교 결과, 우리 v15.5 출력은
+        //   모든 문단의 instanceId 를 0x80000000 으로 하드코드해서 원본의 0,
+        //   0x80000000, 그리고 그 외 값들과 충돌. byte-level mismatch 의
+        //   가장 큰 비중을 차지. HWPX 의 hp:p id 는 paragraph instance id
+        //   그대로이므로 그 값을 사용한다 (id 없거나 음수면 0x80000000 fallback).
+        long parsedId = getAttrLong(pEl, "id", -1L);
+        para.instanceId = (parsedId < 0) ? 0x80000000L : parsedId;
 
         boolean pageBreak   = getAttrBool(pEl, "pageBreak", false);
         boolean columnBreak = getAttrBool(pEl, "columnBreak", false);
@@ -641,30 +704,13 @@ public class SectionParser {
         // nChars 설정
         para.nChars = charPos;
 
-        // ---- 하이퍼링크용 PARA_RANGE_TAG 생성 ----
-        // 한글은 하이퍼링크 필드 컨트롤을 포함하는 문단에 PARA_RANGE_TAG 항목이
-        // 있어야 하이퍼링크 텍스트를 클릭 가능/스타일 적용 대상으로 인식함.
-        // 한컴이 작성한 참조 HWP에서 문단 내 n개 하이퍼링크에 대해 관찰된 패턴:
-        //   - 3 × (start=0, end=nChars, sort=0, data=0)                 // 내부 marker
-        //   - 1 × (start=0, end=nChars, sort=1, data=hyperlinkCharShape) // 스타일 참조
-        // 하이퍼링크가 있는 각 문단마다 이 패턴을 출력. data=0은 안전(특정 charshape
-        // 재정의 없음이 기본)하며 클릭 가능성은 여전히 활성화됨.
-        int hyperlinkCount = 0;
-        for (RunInfo ri : runs) {
-            for (RunItem item : ri.items) {
-                if (item.type == RunItem.Type.FIELD
-                        && item.ctrlId == CtrlId.FIELD_HYPERLINK) {
-                    hyperlinkCount++;
-                }
-            }
-        }
-        if (hyperlinkCount > 0) {
-            long end = para.nChars;
-            for (int i = 0; i < 3 * hyperlinkCount; i++) {
-                para.rangeTags.add(new ParaRangeTag(0, end, 0, 0));
-            }
-            para.rangeTags.add(new ParaRangeTag(0, end, 1, 0));
-        }
+        // v15.5: 하이퍼링크용 PARA_RANGE_TAG 자동 추가를 제거함.
+        // 입찰공고문.hwp (한/글 원본) 와 byte 비교 결과, 한/글은 하이퍼링크가
+        // 있는 문단에 PARA_RANGE_TAG 를 emit 하지 *않음*. 이전 동작 (v15.4
+        // 까지) 은 paragraph 마다 4N 개의 spurious tag(48 byte 레코드 × N)
+        // 를 추가했고, 한/글 의 엄격한 reader 는 이를 stream 정합성 위반으로
+        // 보고 "파일이 손상되었습니다." 로 거부했다. 입찰공고문 손상의
+        // 핵심 원인 중 하나.
 
         // Fix #1: 문단이 문단 끝 marker만 가질 경우(nChars=1, 0x000D 하나뿐),
         // PARA_TEXT를 출력하지 않음. 리더는 nChars=1에서 암묵적 문단 분리를 추론.
@@ -996,6 +1042,10 @@ public class SectionParser {
     private static CtrlTable parseTableImpl(Element tblEl, HwpDocument doc) {
         CtrlTable tbl = new CtrlTable();
 
+        // v15.6: hp:tbl 의 id 속성을 instanceId 로 매핑. 이전엔 0 으로 방치되어
+        //   한/글 원본의 CTRL_HEADER (size 46) body offset 36-39 와 mismatch.
+        tbl.instanceId = getAttrLong(tblEl, "id", 0L);
+
         tbl.rowCount     = getAttrInt(tblEl, "rowCnt", 0);
         tbl.colCount     = getAttrInt(tblEl, "colCnt", 0);
         tbl.cellSpacing  = getAttrInt(tblEl, "cellSpacing", 0);
@@ -1236,9 +1286,24 @@ public class SectionParser {
     private static CtrlHeaderFooter parseHeaderFooter(Element el, int ctrlId, HwpDocument doc) {
         CtrlHeaderFooter hf = new CtrlHeaderFooter(ctrlId);
 
-        // 머리말/꼬리말 내부 하위 문단 파싱
+        // v15.6: header/footer 의 applyPageType 을 property bit 0-1 로 인코딩.
+        //   0=BOTH, 1=EVEN_ONLY, 2=ODD_ONLY (HWP 5.0 spec)
+        String apt = getAttrStr(el, "applyPageType", "BOTH");
+        if ("EVEN_ONLY".equals(apt)) hf.property = 1L;
+        else if ("ODD_ONLY".equals(apt)) hf.property = 2L;
+        else hf.property = 0L;
+
+        // 머리말/꼬리말 내부 하위 문단 + textWidth/textHeight 파싱
         Element subList = getChildElement(el, HP, "subList");
         if (subList != null) {
+            // v15.6: subList 의 textWidth/textHeight 를 추출 — 이전엔 0 으로 방치되어
+            // 한/글 원본과 byte mismatch 발생. (HWP LIST_HEADER 의 textWidth/Height
+            // 필드를 정확히 채워야 한/글이 본문 영역 크기를 올바르게 인식.)
+            hf.textWidth  = getAttrInt(subList, "textWidth", 0);
+            hf.textHeight = getAttrInt(subList, "textHeight", 0);
+            hf.textRefFlag = getAttrBool(subList, "hasTextRef", false) ? 1 : 0;
+            hf.numRefFlag  = getAttrBool(subList, "hasNumRef", false) ? 1 : 0;
+
             List<Element> pElements = getChildElements(subList, HP, "p");
             for (Element pEl : pElements) {
                 Paragraph para = parseParagraph(pEl, doc);
@@ -1383,11 +1448,38 @@ public class SectionParser {
         CtrlPicture obj = new CtrlPicture();
         obj.shapeType = shapeType; // "rect", "line", "ellipse" 등
 
+        // v15.6: 그리기 도형(rect/line/...) 의 id 도 instanceId 로 매핑.
+        // 아래쪽에서 'instid' 속성도 별도로 처리되지만, HWPML 의 hp:rect/hp:line
+        // 최상위 id 가 표준. 둘 다 있으면 instid 가 덮어쓴다(아래 line 1438).
+        obj.instanceId = getAttrLong(drawEl, "id", 0L);
+
         // 그림과 동일한 공통 개체 속성 파싱
         Element sz = getChildElement(drawEl, HP, "sz");
         if (sz != null) {
             obj.width  = getAttrInt(sz, "width", 0);
             obj.height = getAttrInt(sz, "height", 0);
+        }
+
+        // v15.7: hp:orgSz (스케일링 전 원본 크기) — SHAPE_COMPONENT initialWidth/Height
+        //   및 SHAPE_COMPONENT_RECTANGLE 의 4 꼭짓점 좌표에 사용된다.
+        //   누락 시 한/글이 "파일이 손상되었습니다" 로 거부 — 입찰공고문 회귀의 진짜 원인.
+        Element orgSzEl = getChildElement(drawEl, HP, "orgSz");
+        if (orgSzEl != null) {
+            obj.originalWidth  = getAttrInt(orgSzEl, "width", obj.width);
+            obj.originalHeight = getAttrInt(orgSzEl, "height", obj.height);
+        }
+
+        // v15.7: hp:renderingInfo → transMatrix/scaMatrix/rotMatrix
+        //   SHAPE_COMPONENT 의 groupXOffset/YOffset 및 affine 행렬에 사용.
+        //   누락 시 객체 위치가 한/글에서 0,0 으로 그려져 손상으로 인식될 수 있음.
+        Element renderInfoEl = getChildElement(drawEl, HP, "renderingInfo");
+        if (renderInfoEl != null) {
+            Element trans = getChildElement(renderInfoEl, HC, "transMatrix");
+            if (trans != null) obj.transMatrix = parseMatrix6(trans);
+            Element sca = getChildElement(renderInfoEl, HC, "scaMatrix");
+            if (sca != null) obj.scaMatrix = parseMatrix6(sca);
+            Element rot = getChildElement(renderInfoEl, HC, "rotMatrix");
+            if (rot != null) obj.rotMatrix = parseMatrix6(rot);
         }
 
         Element pos = getChildElement(drawEl, HP, "pos");
@@ -1472,7 +1564,10 @@ public class SectionParser {
                     case "BOTTOM":   vaVal = 2; break;
                     default:         vaVal = 0; break;
                 }
-                obj.textboxListProperty = (tdVal & 0x7) | ((lwVal & 0x3) << 3) | ((long)(vaVal & 0x3) << 21);
+                // v15.8: vertAlign 비트 위치 수정. 셀 LIST_HEADER 와 동일하게 bit 5~6 사용.
+                //   이전 v15.7 까지는 bit 21 로 잘못 emit 되어 한/글이 vertAlign=TOP 으로
+                //   해석. byte-level diff 1 byte (LIST_HEADER body byte 4) 발생.
+                obj.textboxListProperty = (tdVal & 0x7) | ((lwVal & 0x3) << 3) | ((long)(vaVal & 0x3) << 5);
 
                 List<Element> pElements = getChildElements(subList, HP, "p");
                 for (Element pEl : pElements) {
@@ -1487,6 +1582,9 @@ public class SectionParser {
 
     private static CtrlPicture parsePicture(Element picEl) {
         CtrlPicture pic = new CtrlPicture();
+
+        // v15.6: hp:pic 의 id 를 instanceId 로 매핑 (CTRL_HEADER instid 필드용)
+        pic.instanceId = getAttrLong(picEl, "id", 0L);
 
         // hp:pic 요소에서 zOrder
         pic.zOrder = getAttrInt(picEl, "zOrder", 0);

@@ -90,7 +90,10 @@ public class DocInfoWriter {
             out.write(buildForbiddenChar());
 
             // COMPATIBLE_DOCUMENT (레벨 0) — HWPX 소스에서 가져온 값
-            out.write(buildCompatibleDocument(doc.compatTargetProgram));
+            // ODT 소스 경로(emitCompatibleDocument=false)에서는 생략한다(변형B).
+            if (doc.emitCompatibleDocument) {
+                out.write(buildCompatibleDocument(doc.compatTargetProgram));
+            }
 
             // LAYOUT_COMPATIBILITY (레벨 1) — 5개의 UINT32 레벨 마스크
             out.write(buildLayoutCompatibility(doc.layoutCompatLevels));
@@ -245,23 +248,22 @@ public class DocInfoWriter {
             w.writeInt32(bf.fillPatType);      // 4 byte
         }
 
-        // 그라디언트 채우기 데이터 (HWP 5.1.x 포맷, 참조 바이너리로 검증됨)
+        // 그라디언트 채우기 데이터 — HWP 5.0 spec 정합 포맷.
+        // v15.10: 입찰공고문.hwp 참조본 byte 비교 결과 spec 표준 layout 확인:
+        //   BYTE type(1) + INT32 angle(4) + INT32 centerX(4) + INT32 centerY(4)
+        //   + INT32 step(4) + INT32 colorNum(4) + COLORREF colors[colorNum]*4
+        //   = 21 byte 헤더 + 4*N byte colors
+        // 이전 v15.9 까지: INT16 필드 + 다중 padding 으로 21 byte 를 채웠으나
+        //   spec 와 어긋남. 한/글이 gradient 헤더를 잘못 해석하여 colorNum 이
+        //   garbage 값으로 읽혀 black fallback 으로 셀이 검정 채움 → "검은배경
+        //   의 그림" 회귀의 진짜 원인.
         if (hasGradient) {
-            // HWP 5.1.x 그라디언트 포맷 — 참조 00.hwp BF[7]과 byte 단위로 일치:
-            //   type(2)+angle(2)+centerX(2)+centerY(2)+field(2)+field(2)
-            //   +pad(1)+step(4)+colorNum(2)+pad(2)+colors(4*n)
-            w.writeInt16(bf.gradType);         // [+0,+1]: 그라디언트 타입
-            w.writeInt16(bf.gradAngle);        // [+2,+3]: 시작 각도
-            w.writeInt16(bf.gradCenterX * 256); // [+4,+5]: 중심 X (퍼센트 * 256)
-            w.writeInt16(0);                   // [+6,+7]: 참조 파일에서 항상 0
-            w.writeInt16(bf.gradCenterX * 256); // [+8,+9]: 중심 X (중복)
-            w.writeInt16(0);                   // [+10,+11]: 참조 파일에서 항상 0
-            w.writeUInt8(0);                   // [+12]: 패딩 byte
-            w.writeUInt8(bf.gradStep);         // [+13]: step (UINT8, 예: 255)
-            w.writeInt16(0);                   // [+14,+15]: 패딩
-            w.writeUInt8(0);                   // [+16]: 패딩
-            w.writeInt16(bf.gradColorNum);     // [+17,+18]: 색상 개수
-            w.writeInt16(0);                   // [+19,+20]: 패딩
+            w.writeUInt8(bf.gradType);         // [+0]: 그라디언트 타입 (BYTE)
+            w.writeInt32(bf.gradAngle);        // [+1..+4]: 시작 각도 (INT32)
+            w.writeInt32(bf.gradCenterX);      // [+5..+8]: 중심 X (INT32, 퍼센트)
+            w.writeInt32(bf.gradCenterY);      // [+9..+12]: 중심 Y (INT32, 퍼센트)
+            w.writeInt32(bf.gradStep);         // [+13..+16]: step (INT32)
+            w.writeInt32(bf.gradColorNum);     // [+17..+20]: 색상 개수 (INT32)
             // 색상 배열
             if (bf.gradColors != null) {
                 for (int i = 0; i < bf.gradColorNum && i < bf.gradColors.length; i++) {
@@ -553,29 +555,38 @@ public class DocInfoWriter {
     /**
      * DOC_DATA 레코드 (태그 0x01B, 레벨 0).
      * 문서의 임의 데이터를 ParameterSet으로 담는다.
-     * 참조 파일은 인쇄 설정과 함께 setId=540 (0x021C), itemCount=1을 사용한다.
-     * 인쇄 정보를 포함한 최소한의 유효한 DOC_DATA를 기록한다.
+     *
+     * <p>v14.5: 원본 case1.hwp (한/글 작성) 의 DOC_DATA 80 byte 와 byte-for-byte
+     * 일치하도록 수정. 이전 코드는 다음 4가지 차이가 있어 한/글 호환을 깨뜨렸다.
+     * <ul>
+     *   <li>ParameterSet 의 itemCount 가 INT16(2byte) 로 작성됨 → 원본은 INT32(4byte)</li>
+     *   <li>외부 itemId 0x0007 → 원본은 0x0207</li>
+     *   <li>중첩 setId 0x0680 → 원본은 0x0207</li>
+     *   <li>itemId 패턴 / type(0x0006/0x0007 vs 0x0004) / value 가 원본과 모두 다름</li>
+     * </ul>
+     * 외부 6 + item-header 4 + 중첩 6 + 8×8 = 80 byte 로 정확히 맞춤.
      */
     private static byte[] buildDocData() {
         HwpBinaryWriter w = new HwpBinaryWriter(128);
-        // ParameterSet: setId(WORD) + itemCount(INT16)
+        // 외부 ParameterSet: setId(UINT16) + itemCount(INT32) = 6 byte
         w.writeUInt16(0x021C);  // setId = 540 (인쇄 정보 세트)
-        w.writeInt16(1);        // 1개 항목
+        w.writeInt32(1);        // INT32 itemCount
 
-        // 항목 0: PIT_SET (타입 0x8000)
-        w.writeUInt16(0x0007);  // itemId = 7
-        w.writeUInt16(0x8000);  // 타입 = PIT_SET (중첩된 ParameterSet)
+        // 항목 0: PIT_SET — itemId(2) + type(2) = 4 byte
+        w.writeUInt16(0x0207);  // itemId 0x0207 (원본 일치)
+        w.writeUInt16(0x8000);  // type = PIT_SET
 
-        // 중첩된 ParameterSet: setId=0x0680 itemCount=8
-        w.writeUInt16(0x0680);
-        w.writeInt16(8);
+        // 중첩 ParameterSet: setId(UINT16) + itemCount(INT32) = 6 byte
+        w.writeUInt16(0x0207);  // nested setId 0x0207
+        w.writeInt32(8);        // INT32 nested itemCount
 
-        // 8개 항목: 다양한 인쇄 설정 (모두 PIT_I4 = 타입 4, 값 0)
-        int[] itemIds = {0x400E, 0x400E, 0x400A, 0x400A, 0x401F, 0x401D, 0x4006, 0x4006};
-        int[] values = {0, 0, 0, 0, 100, 0, 0, 0};
+        // 8개 nested items: itemId(2) + type(2) + value(INT32, 4byte) = 8 byte each, 64 byte total
+        int[] itemIds = {0x4006, 0x400E, 0x400A, 0x401F, 0x401D, 0x401A, 0x4010, 0x4020};
+        int[] types   = {0x0006, 0x0006, 0x0006, 0x0007, 0x0006, 0x0006, 0x0007, 0x0007};
+        int[] values  = {     4,      0,      0,    100,      0,      0,      0,    100};
         for (int i = 0; i < 8; i++) {
             w.writeUInt16(itemIds[i]);
-            w.writeUInt16(0x0004);  // PIT_I4
+            w.writeUInt16(types[i]);
             w.writeInt32(values[i]);
         }
 

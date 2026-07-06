@@ -453,15 +453,33 @@ public final class XmlHelper {
     }
 
     /**
-     * 표용 page break 타입 매핑.
+     * 표용 page break 타입 매핑 — OWPML pageBreak 문자열 → HWP table property bits 0-1.
+     *
+     * <p>[v15.36 fix] hwp2hwpx 외부 라이브러리의 매핑(HWP→HWPX 방향) 과 일관되도록
+     *   역방향 매핑을 통일한다. hwp2hwpx ForTable.tablePageBreak() 매핑:
+     *  <ul>
+     *    <li>NoDivide (ordinal 0)     → OWPML "NONE"</li>
+     *    <li>DivideByCell (ordinal 1) → OWPML "CELL"</li>
+     *    <li>Divide (ordinal 2)       → OWPML "TABLE"</li>
+     *  </ul>
+     *
+     *  한/글 UI 표시 (DivideAtPageBoundary 의 enum 이름과 일치):
+     *  <ul>
+     *    <li>NoDivide   = "나누지 않음" / "한 쪽으로"</li>
+     *    <li>DivideByCell = "셀 단위로 나눔"</li>
+     *    <li>Divide     = "쪽 경계에서 나눔" / "나눔"</li>
+     *  </ul>
+     *
+     *  이전 매핑 (TABLE→0, CELL→1, NONE→2) 은 hwp2hwpx 와 정반대로 NoDivide ↔ Divide 가
+     *  뒤집혀 HWP↔HWPX roundtrip 시 값이 토글되는 버그가 있었다.
      */
     public static int parsePageBreakType(String type) {
-        if (type == null || type.isEmpty()) return 0;
+        if (type == null || type.isEmpty()) return 1; // 기본값: DivideByCell (Hangul UI 기본 "셀 단위로 나눔")
         switch (type) {
-            case "TABLE":  return 1;
-            case "CELL":   return 2;
-            case "NONE":   return 0;
-            default:       return 0;
+            case "NONE":   return 0;  // NoDivide   ("나누지 않음")
+            case "CELL":   return 1;  // DivideByCell ("셀 단위로 나눔")
+            case "TABLE":  return 2;  // Divide     ("쪽 경계에서 나눔" / "나눔")
+            default:       return 1;
         }
     }
 

@@ -22,4 +22,6 @@ public class HwpDocument {
     public int compatTargetProgram = 0;
     /** HWPTAG_LAYOUT_COMPATIBILITY용 5개의 UINT32 레벨 마스크. */
     public long[] layoutCompatLevels = new long[] { 0, 0, 0, 0, 0 };
+    /** false면 COMPATIBLE_DOCUMENT 레코드를 생략한다(ODT 소스 경로). */
+    public boolean emitCompatibleDocument = true;
 }

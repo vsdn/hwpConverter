@@ -122,9 +122,17 @@ public class DistributionWriter {
             DirectoryEntry viewText = outputRoot.createDirectory("ViewText");
             DirectoryEntry dummyBody = outputRoot.createDirectory("BodyText");
 
-            // 빈 섹션 더미 : 4-byte 크기 0 레코드(모든 필드 0). hwp2hwpx 가
-            // 이를 읽으면 "No content" 류의 예외로 즉시 실패하여 일관된 동작.
-            byte[] emptySectionDummy = new byte[]{0, 0, 0, 0};
+            // 빈 섹션 더미 : 압축된 빈 raw-deflate 스트림 2 byte.
+            // FileHeader.properties bit 0 (compressed) 이 켜진 배포용 HWP 에서는
+            // 모든 Section 스트림이 raw-deflate 으로 inflate 가능해야 한다.
+            // v13.4~v15.2 의 4-byte 영(0) 더미는 raw-deflate 으로 해석되지 않아
+            // BinData 가 없는 파일(예: 입찰공고문.hwpx)에서 한/글이 BodyText 를
+            // 먼저 inflate 하다가 실패해 "파일이 손상되었습니다." 로 거부했다.
+            // {0x03,0x00} = BFINAL=1 + BTYPE=01 fixed-Huffman + 즉시 end-of-block
+            //  → inflate 결과 0 byte (한/글은 본문이 ViewText 에 있다고 인식하고
+            //    fallback). hwplib 등 외부 라이브러리는 "No content / no paragraphs"
+            //    수준의 깔끔한 실패를 받는다 (v13.4 의 DRM 평문 차단 의도 유지).
+            byte[] emptySectionDummy = new byte[]{0x03, 0x00};
 
             for (Entry entry : bodyText) {
                 if (entry instanceof DocumentEntry) {

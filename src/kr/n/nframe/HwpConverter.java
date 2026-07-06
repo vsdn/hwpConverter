@@ -43,6 +43,9 @@ public class HwpConverter {
             System.out.println("[HwpConverter] Section0 paragraphs: " + doc.sections.get(0).paragraphs.size());
         }
 
+        // v16t67: 목차 인라인 DOT leader 탭을 header TabDef DOT-fill 로 매핑 (HWPX→HWP 전용)
+        kr.n.nframe.hwplib.reader.TocDotLeaderMapper.apply(doc);
+
         System.out.println("[HwpConverter] Writing HWP: " + filePathHwp);
         HwpWriter.write(doc, filePathHwp);
 
@@ -51,8 +54,18 @@ public class HwpConverter {
 
     /**
      * HWP → HWPX 변환 (neolord0/hwp2hwpx 라이브러리 사용).
+     * v16t50 R7: 종전 호출 그대로 — 원본 HWP 입력으로 간주(sourceIsOdt=false).
      */
     public void convertHwpToHwpx(String filePathHwp, String filePathHwpx) throws Exception {
+        convertHwpToHwpx(filePathHwp, filePathHwpx, false);
+    }
+
+    /**
+     * v16t50 R7: ODT 직변환 경로 전용 overload. sourceIsOdt=true 면 HwpxPostProcessor 의
+     * 모든 표 pageBreak 강제 덮어쓰기를 스킵해 빌더가 매긴 표별 pageBreak 분포가 보존된다.
+     * MD→HWPX 등 hwp 입력 경로는 종전 메서드(=false) 호출이라 byte 출력 불변.
+     */
+    public void convertHwpToHwpx(String filePathHwp, String filePathHwpx, boolean sourceIsOdt) throws Exception {
         ensureDistinctPaths(filePathHwp, filePathHwpx);
         // 배포용(dist) HWP 파일 조기 감지: FileHeader.properties 의 bit 2 가 켜져 있으면
         // 배포용 문서이며 AES-128 암호화된 ViewText 스트림만 실제 본문을 담고 있다.
@@ -81,6 +94,13 @@ public class HwpConverter {
         // 설정을 다시 주입한다.
         java.util.List<int[]> tabSettings = collectHwpTabSettings(hwpFile);
 
+        // v15.11: hwpxlib 1.0.9 의 writer 에는 BookmarkWriter 가 없어 hwp2hwpx
+        //   가 만든 Bookmark 객체가 XML 로 직렬화되지 않는다. 그 결과 책갈피로
+        //   target 되는 하이퍼링크 (?bookmark_name) 가 한/글에서 클릭해도 이동할
+        //   곳이 없음. 회피책으로 소스 HWP 의 책갈피 이름을 paragraph 별로 수집
+        //   하여 XML 사후 재작성 단계에서 <hp:bookmark> 를 주입한다.
+        java.util.List<java.util.List<String>> sectionBookmarks = collectHwpBookmarks(hwpFile);
+
         System.out.println("[HwpConverter] Converting HWP → HWPX...");
         HWPXFile hwpxFile = Hwp2Hwpx.toHWPX(hwpFile);
 
@@ -89,7 +109,7 @@ public class HwpConverter {
         // HWPCurrent에서 만들어진 문서는 MS_WORD 프로파일 + 레이아웃 플래그 + CELL 페이지
         // 분리를 받고, MSWord 출처 문서는 hwp2hwpx 기본값(HWP201X + 빈 compat)을 유지한다.
         // 프로파일별 세부 사항은 HwpxPostProcessor javadoc 참조.
-        HwpxPostProcessor.normalize(hwpFile, hwpxFile);
+        HwpxPostProcessor.normalize(hwpFile, hwpxFile, sourceIsOdt);
 
         System.out.println("[HwpConverter] Writing HWPX: " + filePathHwpx);
         HWPXWriter.toFilepath(hwpxFile, filePathHwpx);
@@ -99,7 +119,7 @@ public class HwpConverter {
         // TA-05의 의도적으로 비어 있는 2페이지를 한글에서 다시 열었을 때 보존하기 위해
         // 필요하다. 또한 HWP→HWPX 텍스트 변환 중 hwplib가 U+FFFD U+FFFD로 망가뜨린
         // astral-plane 코드 포인트를 다시 주입한다.
-        HwpxXmlRewriter.rewrite(filePathHwpx, astralCodePoints, tabSettings);
+        HwpxXmlRewriter.rewrite(filePathHwpx, astralCodePoints, tabSettings, sectionBookmarks, sourceIsOdt);
 
         System.out.println("[HwpConverter] Conversion complete.");
     }
@@ -116,6 +136,20 @@ public class HwpConverter {
     public void makeHwpDist(String inputPath, String outputPath,
                             String password, boolean noCopy, boolean noPrint) throws Exception {
         ensureDistinctPaths(inputPath, outputPath);
+
+        // [v16t64] 이미 배포용(DISTRIBUTE 비트=1) 입력의 재배포 차단 가드.
+        // 배포용 문서는 본문이 암호화된 ViewText 로 옮겨지고 BodyText 에는 빈 더미만
+        // 남는다. 그대로 --dist 를 재적용하면 DistributionWriter 가 그 빈 BodyText 를
+        // 다시 읽어 암호화 → "빈 본문" 배포본이 만들어지고 한/글이 "파일이 손상되었습니다"
+        // 로 거부한다(이전엔 조용히 빈 문서가 생성됐음). 일반 원본(비트=0)만 허용한다.
+        if (isDistributedHwp(inputPath)) {
+            String msg = "입력이 이미 배포용 문서입니다 (FileHeader DISTRIBUTE 비트=1): " + inputPath
+                    + " — 배포용 문서를 다시 --dist 하면 빈 본문이 만들어집니다."
+                    + " 일반 원본 HWP/HWPX 를 입력으로 사용하세요.";
+            System.err.println("[HwpConverter] 오류: " + msg);
+            throw new IllegalStateException(msg);
+        }
+
         // v13.14: 출력 파일의 부모 디렉터리가 없으면 자동 생성한다.
         // 기존에는 부모 디렉터리가 없을 때 FileNotFoundException("지정된 경로를
         // 찾을 수 없습니다") 이 발생해 파일이 생성되지 않는 것처럼 보였다.
@@ -124,29 +158,24 @@ public class HwpConverter {
         boolean inputIsHwpx = inputPath.toLowerCase().endsWith(".hwpx");
         boolean outputIsHwpx = outputPath.toLowerCase().endsWith(".hwpx");
 
-        // v13.14: HWPX 는 HWP 의 DRM(배포용 문서, AES-128 ViewText) 메커니즘을
-        // 지원하지 않는다. 출력 확장자가 .hwpx 이면 DRM 을 건너뛰고 원본의
-        // 내용/양식을 그대로 보존하는 HWPX 를 생성한다.
-        // (이전에는 DistributionWriter 가 .hwpx 경로에도 HWP 바이너리(OLE2,
-        //  d0cf 11e0 ...) 를 그대로 써서 한글 프로그램으로 열 수 없는 손상된
-        //  파일이 만들어졌다. task1(0421) 참조.)
+        // v15.3: HWPX 는 표준상 DRM(배포용 문서, AES-128 ViewText) 메커니즘을
+        // 가지지 않는다 — DRM 은 OLE2 기반 HWP 의 ViewText/Section 스트림 +
+        // FileHeader.properties bit 2 로만 정의되어 있다.
+        // 이전 동작 (v13.14~v15.2) : .hwpx 출력 경로면 DRM 을 건너뛰고
+        //   비암호화 HWPX 를 작성 → 사용자는 "dist 가 안 걸려 있는" 결과
+        //   를 받음. (tasks 4~6, 0512)
+        // 현재 동작 (v15.3) : --dist 의도(복사/인쇄 방지를 적용)를 보존하기 위해
+        //   출력 확장자를 자동으로 .hwp 로 변경하고, 정상적인 DRM HWP 를
+        //   생성한다. 결과 파일은 한/글에서 DRM 보호된 채로 열려 내용이 노출된다.
         if (outputIsHwpx) {
-            System.out.println("[HwpConverter] 주의: HWPX 출력 포맷은 DRM(복사/인쇄 방지)"
-                    + " 을 지원하지 않으므로 보호 옵션이 적용되지 않습니다.");
-            System.out.println("[HwpConverter] 원본 내용 및 양식을 보존하여 HWPX 로 변환합니다.");
-            if (inputIsHwpx) {
-                // HWPX → HWPX: 원본 바이트를 그대로 복사해 내용/양식을 100% 보존한다.
-                java.nio.file.Files.copy(
-                        java.nio.file.Paths.get(inputPath),
-                        java.nio.file.Paths.get(outputPath),
-                        java.nio.file.StandardCopyOption.REPLACE_EXISTING);
-                System.out.println("[HwpConverter] Writing HWPX: " + outputPath);
-            } else {
-                // HWP → HWPX: 일반 HWP→HWPX 변환을 사용한다 (DRM 없이).
-                convertHwpToHwpx(inputPath, outputPath);
-            }
-            System.out.println("[HwpConverter] Conversion complete.");
-            return;
+            // [v16t63] --dist 출력 경로가 .hwpx 면 강제개명 없이 그 확장자를 그대로
+            // 따른다. 단, 내용은 진짜 HWPX(OWPML zip) 컨테이너가 아니라 보안 HWP
+            // (CFB / OLE2, 배포용 DRM) 바이너리다. 복사/인쇄 방지 DRM 은 HWP5 전용
+            // 규격이며 HWPX/OWPML 표준엔 인코딩이 없기 때문이다. 개명하지 않고
+            // 아래 DistributionWriter 폴스루로 그대로 진행한다.
+            System.out.println("[HwpConverter] 주의: 출력 확장자 .hwpx 를 그대로 유지하되,"
+                    + " 내용은 보안 HWP(CFB, 배포용)입니다. 진짜 HWPX 컨테이너가 아닙니다.");
+            outputIsHwpx = false;
         }
 
         String hwpPath = inputPath;
@@ -161,6 +190,8 @@ public class HwpConverter {
                 convertHwpxToHwp(inputPath, hwpPath);
             }
 
+            // v16t42 비덮어쓰기: 출력이 이미 있으면 새 이름(N)으로 저장.
+            outputPath = kr.n.nframe.newfeature.OutputNaming.unique(outputPath);
             System.out.println("[HwpConverter] Creating Distribution HWP (noCopy=" + noCopy + ", noPrint=" + noPrint + ")");
             DistributionWriter.makeDistribution(hwpPath, outputPath, password, noCopy, noPrint);
 
@@ -225,6 +256,48 @@ public class HwpConverter {
     }
 
     /**
+     * [v16t64] 입력 파일이 "이미 배포용 문서"인지 판별한다.
+     * 확장자가 아니라 실제 내용으로 판단: CFB(OLE2) 매직이 아니면(예: 진짜 HWPX zip)
+     * false. CFB 이면 FileHeader 스트림의 properties DWORD(offset 36) bit 2(배포용)
+     * 를 검사한다. FileHeader 가 없거나 파싱 실패면 false(일반 진행).
+     */
+    private static boolean isDistributedHwp(String path) {
+        if (path == null) return false;
+        java.io.File f = new java.io.File(path);
+        if (!f.isFile()) return false;
+        // 1) CFB(OLE2) 매직 확인 — 아니면 배포용 HWP 아님
+        try (java.io.FileInputStream fis = new java.io.FileInputStream(f)) {
+            byte[] magic = new byte[8];
+            int n = 0;
+            while (n < 8) { int r = fis.read(magic, n, 8 - n); if (r < 0) break; n += r; }
+            byte[] cfb = {(byte) 0xD0, (byte) 0xCF, 0x11, (byte) 0xE0,
+                          (byte) 0xA1, (byte) 0xB1, 0x1A, (byte) 0xE1};
+            if (n < 8 || !java.util.Arrays.equals(magic, cfb)) return false;
+        } catch (java.io.IOException e) {
+            return false;
+        }
+        // 2) FileHeader 스트림 properties bit 2 검사
+        try (java.io.FileInputStream fis = new java.io.FileInputStream(f);
+             org.apache.poi.poifs.filesystem.POIFSFileSystem pfs =
+                     new org.apache.poi.poifs.filesystem.POIFSFileSystem(fis)) {
+            org.apache.poi.poifs.filesystem.DocumentEntry fh =
+                    (org.apache.poi.poifs.filesystem.DocumentEntry) pfs.getRoot().getEntry("FileHeader");
+            try (org.apache.poi.poifs.filesystem.DocumentInputStream dis =
+                         new org.apache.poi.poifs.filesystem.DocumentInputStream(fh)) {
+                byte[] buf = new byte[40];
+                int n = 0;
+                while (n < 40) { int r = dis.read(buf, n, 40 - n); if (r < 0) break; n += r; }
+                if (n < 40) return false;
+                int props = (buf[36] & 0xFF) | ((buf[37] & 0xFF) << 8)
+                          | ((buf[38] & 0xFF) << 16) | ((buf[39] & 0xFF) << 24);
+                return (props & 0x04) != 0;  // bit 2 = 배포용 문서
+            }
+        } catch (Exception e) {
+            return false;  // FileHeader 없음/파싱 실패 → 일반 문서로 간주
+        }
+    }
+
+    /**
      * HWP 본문의 모든 일반 텍스트 문자를 스캔하여 등장 순서대로 astral-plane
      * 코드 포인트(Supplementary Multilingual Plane 이상)를 수집한다.
      * 각 high+low UTF-16 surrogate pair를 하나의 유니코드 코드 포인트로 결합한다.
@@ -272,6 +345,71 @@ public class HwpConverter {
             }
         }
         return out;
+    }
+
+    /**
+     * 소스 HWP 의 책갈피(ControlBookmark) 를 paragraph 별로 수집한다.
+     *
+     * <p>v15.11: hwpxlib 1.0.9 의 writer 에 BookmarkWriter 가 부재하여
+     * hwp2hwpx 가 만든 Bookmark 객체가 HWPX XML 로 직렬화되지 않는다 →
+     * 책갈피 target 이 사라져 ?bookmark_name 하이퍼링크가 한/글에서 동작하지
+     * 않음. 이 메서드로 paragraph 인덱스 → 책갈피 이름 리스트를 수집한 뒤
+     * HwpxXmlRewriter 에서 &lt;hp:ctrl&gt;&lt;hp:bookmark name="..."/&gt;&lt;/hp:ctrl&gt;
+     * 를 첫 번째 섹션의 해당 위치에 직접 주입한다.</p>
+     *
+     * @return outer = 섹션 0 paragraph 인덱스, inner = 해당 paragraph 에 부착된
+     *         책갈피 이름들 (순서 보존). 일반적으로 paragraph 당 책갈피는 0~1 개.
+     */
+    private static java.util.List<java.util.List<String>> collectHwpBookmarks(HWPFile hwp) {
+        java.util.List<java.util.List<String>> result = new java.util.ArrayList<>();
+        if (hwp == null || hwp.getBodyText() == null) return result;
+        if (hwp.getBodyText().getSectionList().isEmpty()) return result;
+        kr.dogfoot.hwplib.object.bodytext.Section sec = hwp.getBodyText().getSectionList().get(0);
+        for (kr.dogfoot.hwplib.object.bodytext.paragraph.Paragraph p : sec) {
+            java.util.List<String> names = new java.util.ArrayList<>();
+            if (p != null && p.getControlList() != null) {
+                for (kr.dogfoot.hwplib.object.bodytext.control.Control c : p.getControlList()) {
+                    // HWP 의 책갈피는 두 가지 형태가 있다:
+                    //   1) ControlBookmark      — standalone CTRL_HEADER 'bmkt'
+                    //   2) ControlField (FIELD_BOOKMARK) — extended field '%bmk'
+                    // 실제 입찰공고문/TA-03 등은 (2) 케이스. getType() 으로 분기.
+                    boolean isBookmark = (c instanceof kr.dogfoot.hwplib.object.bodytext.control.ControlBookmark)
+                            || (c instanceof kr.dogfoot.hwplib.object.bodytext.control.ControlField
+                                && c.getType() == kr.dogfoot.hwplib.object.bodytext.control.ControlType.FIELD_BOOKMARK);
+                    if (isBookmark) {
+                        String name = extractBookmarkName(c);
+                        if (name != null && !name.isEmpty()) names.add(name);
+                    }
+                }
+            }
+            result.add(names);
+        }
+        return result;
+    }
+
+    /**
+     * 책갈피 이름 추출. ControlField 는 getName() 으로 직접, ControlBookmark 는
+     * CtrlData ParameterSet 의 itemId 0x4000 String 값으로 추출.
+     */
+    private static String extractBookmarkName(kr.dogfoot.hwplib.object.bodytext.control.Control c) {
+        try {
+            if (c instanceof kr.dogfoot.hwplib.object.bodytext.control.ControlField) {
+                String n = ((kr.dogfoot.hwplib.object.bodytext.control.ControlField) c).getName();
+                if (n != null && !n.isEmpty()) return n;
+            }
+            kr.dogfoot.hwplib.object.bodytext.control.bookmark.CtrlData cd = c.getCtrlData();
+            if (cd == null) return null;
+            kr.dogfoot.hwplib.object.bodytext.control.bookmark.ParameterSet ps = cd.getParameterSet();
+            if (ps == null) return null;
+            kr.dogfoot.hwplib.object.bodytext.control.bookmark.ParameterItem item =
+                    ps.getParameterItem(0x4000);
+            if (item == null) return null;
+            if (item.getType() != kr.dogfoot.hwplib.object.bodytext.control.bookmark.ParameterType.String)
+                return null;
+            return item.getValue_BSTR();
+        } catch (Throwable t) {
+            return null;
+        }
     }
 
     private static void collectTabsFromParagraph(
@@ -466,6 +604,17 @@ public class HwpConverter {
     }
 
     /**
+     * v13.35: 경로가 "출력 파일" 로 보이는지 (vs. 디렉터리) 판별.
+     * HWP/HWPX/MD 확장자로 끝나면 파일로 간주하고, 그 외는 디렉터리 후보로 본다.
+     * 다건 파일 지정 vs 단건 구분에 사용.
+     */
+    private static boolean looksLikeOutputFilePath(String s) {
+        if (s == null) return false;
+        String lower = s.toLowerCase();
+        return lower.endsWith(".hwp") || lower.endsWith(".hwpx") || lower.endsWith(".md");
+    }
+
+    /**
      * {@code --dist} 에 공백으로 분리된 경로 인자가 들어왔을 때
      * 한글 안내 메시지를 출력한다. 사용자가 의도한 입력/출력/암호 를
      * 재조합해서 보여주고, 따옴표로 올바르게 감싼 명령 예시를 함께 출력한다.
@@ -605,6 +754,10 @@ public class HwpConverter {
         for (java.io.File f : fs) {
             if (!f.isFile()) continue;
             String low = f.getName().toLowerCase();
+            // v13.35: MD 사이드카 ({md}.origin.hwp / {md}.origin.hwpx) 는 배치 입력에서 제외.
+            //         폴더 안에 .md 와 그 사이드카가 같이 있어도 auto-detect 가 .hwp 로
+            //         잘못 분기되지 않도록 한다. 사이드카는 MD 역변환 시 내부적으로만 참조된다.
+            if (low.endsWith(".origin.hwp") || low.endsWith(".origin.hwpx")) continue;
             for (String ext : exts) {
                 if (low.endsWith(ext)) { out.add(f); break; }
             }
@@ -631,12 +784,19 @@ public class HwpConverter {
      *   · .hwp / .hwpx 가 아닌 확장자
      */
     private static java.io.File validateInputFileForBatch(String rawPath, BatchResult r, int[] skipCounter) {
-        // 1) 빈 문자열 / 공백 → 조용히 스킵 (에러 아님)
+        return validateInputFileForBatch(rawPath, r, skipCounter, ".hwp", ".hwpx");
+    }
+
+    /**
+     * v13.35: 허용 확장자 파라미터화.
+     * 기존 호출(.hwp/.hwpx) 은 위 단축 시그니처가 그대로 사용한다.
+     */
+    private static java.io.File validateInputFileForBatch(String rawPath, BatchResult r,
+                                                          int[] skipCounter, String... allowedExts) {
         if (rawPath == null || rawPath.trim().isEmpty()) {
             skipCounter[0]++;
             return null;
         }
-        // 2) Windows 금칙 문자 (< > | ? * ") 포함 → password를 잘못 자리매김한 경우가 대부분
         if (rawPath.matches(".*[<>|?*\"].*")) {
             r.fail++;
             String msg = rawPath + " : 유효하지 않은 파일명(Windows 금칙 문자 포함). "
@@ -646,7 +806,6 @@ public class HwpConverter {
             return null;
         }
         java.io.File f = new java.io.File(rawPath);
-        // 3) 존재하지 않음
         if (!f.exists()) {
             r.fail++;
             String msg = rawPath + " : 파일이 존재하지 않습니다.";
@@ -654,19 +813,25 @@ public class HwpConverter {
             System.err.println("  [FAIL] " + msg);
             return null;
         }
-        // 4) 디렉터리 → v13.7 부터는 "출력 디렉터리 중복 지정" 등의 실수로 간주하여
-        //    실패가 아닌 SKIP 으로 처리. 에러 카운트에 포함되지 않음.
         if (f.isDirectory()) {
             skipCounter[0]++;
             System.out.println("  [SKIP] " + rawPath
                     + " : 디렉터리 - 출력 디렉터리를 중복 지정한 것으로 보여 건너뜁니다.");
             return null;
         }
-        // 5) 파일은 맞지만 HWP/HWPX 확장자가 아님
         String low = f.getName().toLowerCase();
-        if (!low.endsWith(".hwp") && !low.endsWith(".hwpx")) {
+        boolean ok = false;
+        for (String ae : allowedExts) {
+            if (low.endsWith(ae)) { ok = true; break; }
+        }
+        if (!ok) {
             r.fail++;
-            String msg = rawPath + " : .hwp 또는 .hwpx 확장자가 아닙니다.";
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < allowedExts.length; i++) {
+                if (i > 0) sb.append(" / ");
+                sb.append(allowedExts[i]);
+            }
+            String msg = rawPath + " : " + sb + " 확장자가 아닙니다.";
             r.failDetails.add(msg);
             System.err.println("  [FAIL] " + msg);
             return null;
@@ -683,7 +848,19 @@ public class HwpConverter {
             return;
         }
         if (!dir.mkdirs()) {
-            throw new IOException("출력 디렉터리 생성 실패: " + dir);
+            // v13.33: 더 친절한 에러 메시지 — 경로에 leading/trailing 공백이 있는지 감지
+            String path = dir.getPath();
+            String hint = "";
+            if (!path.equals(path.trim())) {
+                hint = "\n  [원인 추정] 경로 앞/뒤에 공백이 포함되어 있습니다:"
+                     + " [\"" + path + "\"] (길이 " + path.length() + ")"
+                     + "\n  [해결]     명령어에서 따옴표와 경로 사이의 공백을 제거하세요."
+                     + "\n             예) 잘못됨: \" C:\\work\\out\"   →   올바름: \"C:\\work\\out\"";
+            } else if (!dir.getAbsoluteFile().getParentFile().exists()) {
+                hint = "\n  [원인 추정] 상위 디렉터리가 존재하지 않습니다:"
+                     + "\n             상위: " + dir.getAbsoluteFile().getParentFile();
+            }
+            throw new IOException("출력 디렉터리 생성 실패: " + dir + hint);
         }
     }
 
@@ -708,7 +885,7 @@ public class HwpConverter {
             java.io.File o = outFileFor(f, out, ".hwp");
             System.out.println("[" + (i + 1) + "/" + files.size() + "] " + f.getName() + " → " + o.getName());
             try {
-                convertHwpxToHwp(f.getAbsolutePath(), o.getAbsolutePath());
+                convertHwpxToHwp(f.getAbsolutePath(), kr.n.nframe.newfeature.OutputNaming.unique(o.getAbsolutePath()));
                 r.ok++;
             } catch (Exception e) {
                 r.fail++;
@@ -733,7 +910,7 @@ public class HwpConverter {
             java.io.File o = outFileFor(f, out, ".hwpx");
             System.out.println("[" + (i + 1) + "/" + files.size() + "] " + f.getName() + " → " + o.getName());
             try {
-                convertHwpToHwpx(f.getAbsolutePath(), o.getAbsolutePath());
+                convertHwpToHwpx(f.getAbsolutePath(), kr.n.nframe.newfeature.OutputNaming.unique(o.getAbsolutePath()));
                 r.ok++;
             } catch (Exception e) {
                 r.fail++;
@@ -795,7 +972,14 @@ public class HwpConverter {
     //  폴더 전체가 아닌 특정 파일 N개를 골라서 변환
     // ==========================================================
 
-    /** 개별 파일 리스트 → 일반 변환 배치 */
+    /**
+     * 개별 파일 리스트 → 일반 변환 배치.
+     * v13.35: 입력 확장자별 자동 라우팅 —
+     *   · .hwp  → .hwpx : convertHwpToHwpx
+     *   · .hwpx → .hwp  : convertHwpxToHwp
+     *   · .md   → .hwp  : convertMarkdownToHwp   (사이드카 필요)
+     *   · .md   → .hwpx : convertMarkdownToHwpx  (사이드카 필요)
+     */
     public BatchResult batchFiles(java.util.List<java.io.File> inputFiles,
                                   String outputDir, String toExt) throws IOException {
         java.io.File out = new java.io.File(outputDir);
@@ -803,26 +987,124 @@ public class HwpConverter {
         int given = inputFiles.size();
         BatchResult r = new BatchResult();
         int[] skipCounter = new int[]{0};
-        // 입력 파일 사전 검증 (빈 문자열/디렉터리는 SKIP, 금칙 문자/미존재/잘못된 확장자는 FAIL)
+        // 입력 파일 사전 검증 — .hwp / .hwpx / .md 모두 허용 (v13.35)
+        java.util.List<java.io.File> valid = new java.util.ArrayList<>();
+        for (java.io.File raw : inputFiles) {
+            java.io.File v = validateInputFileForBatch(raw.getPath(), r, skipCounter,
+                    ".hwp", ".hwpx", ".md");
+            if (v != null) valid.add(v);
+        }
+        int total = valid.size();
+        int effectiveRequested = given - skipCounter[0];
+        System.out.println("[Batch-Files] " + total + " / " + effectiveRequested + " files → "
+                + out.getAbsolutePath() + "  (toExt=" + toExt + ")"
+                + (r.fail > 0 ? "  (사전 검증 실패 " + r.fail + "건 제외)" : "")
+                + (skipCounter[0] > 0 ? "  (SKIP " + skipCounter[0] + "건 - 입력 자리의 디렉터리/빈 문자열)" : ""));
+        boolean toHwpx = ".hwpx".equals(toExt);
+        HwpMdConverter md = null;
+        for (int i = 0; i < total; i++) {
+            java.io.File f = valid.get(i);
+            java.io.File o = outFileFor(f, out, toExt);
+            String inLow = f.getName().toLowerCase();
+            System.out.println("[" + (i + 1) + "/" + total + "] " + f.getAbsolutePath() + " → " + o.getName());
+            try {
+                if (inLow.endsWith(".md")) {
+                    // v13.35: MD 입력 → 사이드카 기반 역변환
+                    if (md == null) md = new HwpMdConverter();
+                    if (toHwpx) md.convertMarkdownToHwpx(f.getAbsolutePath(), o.getAbsolutePath());
+                    else        md.convertMarkdownToHwp(f.getAbsolutePath(), o.getAbsolutePath());
+                } else if (inLow.endsWith(".hwpx")) {
+                    if (toHwpx) {
+                        // 동일 포맷 변환 요청 — .hwpx → .hwpx 은 의미 없음, 경고
+                        throw new IOException("입력과 출력 포맷이 같습니다 (.hwpx → .hwpx). --to-hwp 를 쓰거나 MD 사이드카를 이용하세요.");
+                    }
+                    convertHwpxToHwp(f.getAbsolutePath(), kr.n.nframe.newfeature.OutputNaming.unique(o.getAbsolutePath()));
+                } else {
+                    // .hwp
+                    if (!toHwpx) {
+                        throw new IOException("입력과 출력 포맷이 같습니다 (.hwp → .hwp). --to-hwpx 를 쓰거나 MD 사이드카를 이용하세요.");
+                    }
+                    convertHwpToHwpx(f.getAbsolutePath(), kr.n.nframe.newfeature.OutputNaming.unique(o.getAbsolutePath()));
+                }
+                r.ok++;
+            } catch (Exception e) {
+                r.fail++;
+                r.failDetails.add(f.getName() + " : " + describeException(e));
+                System.err.println("  [FAIL] " + describeException(e));
+            }
+        }
+        printBatchSummary(r, effectiveRequested);
+        return r;
+    }
+
+    /**
+     * 폴더 전체 → Markdown 배치 (v13.16).
+     * 입력 디렉터리 내 .hwp / .hwpx 파일 전부를 .md 로 변환.
+     */
+    public BatchResult batchAnyToMd(String inputDir, String outputDir) throws IOException {
+        java.io.File in = new java.io.File(inputDir);
+        java.io.File out = new java.io.File(outputDir);
+        ensureOutputDir(out);
+        java.util.List<java.io.File> files = listByExt(in, ".hwp", ".hwpx");
+        System.out.println("[Batch] HWP/HWPX → Markdown : " + files.size()
+                + " files in " + in.getAbsolutePath());
+        BatchResult r = new BatchResult();
+        HwpMdConverter md = new HwpMdConverter();
+        for (int i = 0; i < files.size(); i++) {
+            java.io.File f = files.get(i);
+            java.io.File o = outFileFor(f, out, ".md");
+            System.out.println("[" + (i + 1) + "/" + files.size() + "] "
+                    + f.getName() + " → " + o.getName());
+            try {
+                if (f.getName().toLowerCase().endsWith(".hwpx")) {
+                    md.convertHwpxToMarkdown(f.getAbsolutePath(), o.getAbsolutePath());
+                } else {
+                    md.convertHwpToMarkdown(f.getAbsolutePath(), o.getAbsolutePath());
+                }
+                r.ok++;
+            } catch (Exception e) {
+                r.fail++;
+                r.failDetails.add(f.getName() + " : " + describeException(e));
+                System.err.println("  [FAIL] " + describeException(e));
+            }
+        }
+        printBatchSummary(r, files.size());
+        return r;
+    }
+
+    /**
+     * 개별 파일 리스트 → Markdown 배치 (v13.16).
+     */
+    public BatchResult batchFilesToMd(java.util.List<java.io.File> inputFiles,
+                                      String outputDir) throws IOException {
+        java.io.File out = new java.io.File(outputDir);
+        ensureOutputDir(out);
+        int given = inputFiles.size();
+        BatchResult r = new BatchResult();
+        int[] skipCounter = new int[]{0};
         java.util.List<java.io.File> valid = new java.util.ArrayList<>();
         for (java.io.File raw : inputFiles) {
             java.io.File v = validateInputFileForBatch(raw.getPath(), r, skipCounter);
             if (v != null) valid.add(v);
         }
         int total = valid.size();
-        int effectiveRequested = given - skipCounter[0]; // SKIP 은 "요청"에서 제외
-        System.out.println("[Batch-Files] " + total + " / " + effectiveRequested + " files → "
-                + out.getAbsolutePath() + "  (toExt=" + toExt + ")"
+        int effectiveRequested = given - skipCounter[0];
+        System.out.println("[Batch-Files] HWP/HWPX → Markdown : " + total + " / "
+                + effectiveRequested + " files → " + out.getAbsolutePath()
                 + (r.fail > 0 ? "  (사전 검증 실패 " + r.fail + "건 제외)" : "")
-                + (skipCounter[0] > 0 ? "  (SKIP " + skipCounter[0] + "건 - 입력 자리의 디렉터리/빈 문자열)" : ""));
-        boolean toHwpx = ".hwpx".equals(toExt);
+                + (skipCounter[0] > 0 ? "  (SKIP " + skipCounter[0] + "건)" : ""));
+        HwpMdConverter md = new HwpMdConverter();
         for (int i = 0; i < total; i++) {
             java.io.File f = valid.get(i);
-            java.io.File o = outFileFor(f, out, toExt);
-            System.out.println("[" + (i + 1) + "/" + total + "] " + f.getAbsolutePath() + " → " + o.getName());
+            java.io.File o = outFileFor(f, out, ".md");
+            System.out.println("[" + (i + 1) + "/" + total + "] "
+                    + f.getAbsolutePath() + " → " + o.getName());
             try {
-                if (toHwpx) convertHwpToHwpx(f.getAbsolutePath(), o.getAbsolutePath());
-                else        convertHwpxToHwp(f.getAbsolutePath(), o.getAbsolutePath());
+                if (f.getName().toLowerCase().endsWith(".hwpx")) {
+                    md.convertHwpxToMarkdown(f.getAbsolutePath(), o.getAbsolutePath());
+                } else {
+                    md.convertHwpToMarkdown(f.getAbsolutePath(), o.getAbsolutePath());
+                }
                 r.ok++;
             } catch (Exception e) {
                 r.fail++;
@@ -874,6 +1156,56 @@ public class HwpConverter {
             }
         }
         printBatchSummary(r, effectiveRequested);
+        return r;
+    }
+
+    // ==========================================================
+    //  v13.35: MD → HWP / HWPX 역변환 배치
+    //  (.md 사이드카를 참조해 원본 HWP/HWPX 을 복원 또는 교차변환)
+    // ==========================================================
+
+    /**
+     * 폴더 전체 MD → HWP 배치.
+     * @param inputDir  .md 파일들이 있는 디렉터리 (사이드카 {md}.origin.hwp[x] 포함)
+     * @param outputDir 출력 .hwp 저장 디렉터리
+     */
+    public BatchResult batchMdToHwp(String inputDir, String outputDir) throws IOException {
+        return batchMdToFormat(inputDir, outputDir, ".hwp");
+    }
+
+    /**
+     * 폴더 전체 MD → HWPX 배치.
+     */
+    public BatchResult batchMdToHwpx(String inputDir, String outputDir) throws IOException {
+        return batchMdToFormat(inputDir, outputDir, ".hwpx");
+    }
+
+    private BatchResult batchMdToFormat(String inputDir, String outputDir, String toExt) throws IOException {
+        java.io.File in = new java.io.File(inputDir);
+        java.io.File out = new java.io.File(outputDir);
+        ensureOutputDir(out);
+        java.util.List<java.io.File> files = listByExt(in, ".md");
+        System.out.println("[Batch] Markdown → " + toExt.substring(1).toUpperCase()
+                + " : " + files.size() + " files in " + in.getAbsolutePath());
+        BatchResult r = new BatchResult();
+        HwpMdConverter md = new HwpMdConverter();
+        boolean toHwpx = ".hwpx".equals(toExt);
+        for (int i = 0; i < files.size(); i++) {
+            java.io.File f = files.get(i);
+            java.io.File o = outFileFor(f, out, toExt);
+            System.out.println("[" + (i + 1) + "/" + files.size() + "] "
+                    + f.getName() + " → " + o.getName());
+            try {
+                if (toHwpx) md.convertMarkdownToHwpx(f.getAbsolutePath(), o.getAbsolutePath());
+                else        md.convertMarkdownToHwp(f.getAbsolutePath(), o.getAbsolutePath());
+                r.ok++;
+            } catch (Exception e) {
+                r.fail++;
+                r.failDetails.add(f.getName() + " : " + describeException(e));
+                System.err.println("  [FAIL] " + describeException(e));
+            }
+        }
+        printBatchSummary(r, files.size());
         return r;
     }
 
@@ -933,14 +1265,22 @@ public class HwpConverter {
             //   · 파일 입력 → --out-hwpx / --out-hwp 와 동일하게 취급 (forceOutExt 설정)
             String toModeFromDist = null; // "hwp2hwpx" or "hwpx2hwp" (null = not specified)
             for (int i = 1; i < args.length; i++) {
+                // v13.33: positional 인자의 leading/trailing whitespace 자동 trim.
+                //         사용자가 cmd 에서 " path" 처럼 따옴표와 경로 사이에 공백을
+                //         넣은 경우 File(" C:\\...") 경로 오인으로 "디렉터리 생성 실패" 발생.
                 String a = args[i];
-                if ("--no-copy".equals(a))  { noCopy = true; continue; }
-                if ("--no-print".equals(a)) { noPrint = true; continue; }
-                if ("--out-hwpx".equals(a)) { forceOutExt = ".hwpx"; continue; }
-                if ("--out-hwp".equals(a))  { forceOutExt = ".hwp";  continue; }
-                if ("--to-hwpx".equals(a))  { toModeFromDist = "hwp2hwpx"; continue; }
-                if ("--to-hwp".equals(a))   { toModeFromDist = "hwpx2hwp"; continue; }
-                positional.add(a);
+                String trimmed = a.trim();
+                if ("--no-copy".equals(trimmed))  { noCopy = true; continue; }
+                if ("--no-print".equals(trimmed)) { noPrint = true; continue; }
+                if ("--out-hwpx".equals(trimmed)) { forceOutExt = ".hwpx"; continue; }
+                if ("--out-hwp".equals(trimmed))  { forceOutExt = ".hwp";  continue; }
+                if ("--to-hwpx".equals(trimmed))  { toModeFromDist = "hwp2hwpx"; continue; }
+                if ("--to-hwp".equals(trimmed))   { toModeFromDist = "hwpx2hwp"; continue; }
+                if (!a.equals(trimmed)) {
+                    System.err.println("[경고] 인자 앞/뒤 공백이 감지되어 자동 제거했습니다: \""
+                            + a + "\" → \"" + trimmed + "\"");
+                }
+                positional.add(trimmed);
             }
 
             // --to-hwpx / --to-hwp + 폴더 입력 → 일반 폴더 배치 변환 (--dist 무시)
@@ -1021,17 +1361,36 @@ public class HwpConverter {
 
             String input = positional.get(0);
             String output = positional.get(1);
-            converter.makeHwpDist(input, output, passwordForDist, noCopy, noPrint);
+            try {
+                converter.makeHwpDist(input, output, passwordForDist, noCopy, noPrint);
+            } catch (IllegalStateException dex) {
+                // [v16t64] 이미 배포용 입력 등 배포 거부 — 인자/입력 오류 관례(exit 2).
+                System.err.println("[HwpConverter] 배포 거부: " + dex.getMessage());
+                System.exit(2);
+                return;
+            }
             return;
         }
 
-        // 옵션 플래그 파싱 (--to-hwpx / --to-hwp)
+        // 옵션 플래그 파싱 (--to-hwpx / --to-hwp / --to-md)
+        // v13.33: positional 인자의 leading/trailing whitespace 자동 trim
+        // v14.0: --no-embed / --no-sidecar / --structure 는 폐기 (외부 MD 도 항상 구조 변환)
         java.util.List<String> positional = new java.util.ArrayList<>();
         String toMode = null;
         for (String a : args) {
-            if ("--to-hwpx".equals(a)) { toMode = "hwp2hwpx"; continue; }
-            if ("--to-hwp".equals(a))  { toMode = "hwpx2hwp"; continue; }
-            positional.add(a);
+            String trimmed = a.trim();
+            if ("--to-hwpx".equals(trimmed))    { toMode = "hwp2hwpx"; continue; }
+            if ("--to-hwp".equals(trimmed))     { toMode = "hwpx2hwp"; continue; }
+            if ("--to-md".equals(trimmed))      { toMode = "any2md";   continue; }
+            if ("--no-embed".equals(trimmed) || "--no-sidecar".equals(trimmed) || "--structure".equals(trimmed)) {
+                System.err.println("[안내] " + trimmed + " 옵션은 v14.0부터 사용되지 않습니다 (외부 MD 변환이 항상 구조 변환됨). 무시합니다.");
+                continue;
+            }
+            if (!a.equals(trimmed)) {
+                System.err.println("[경고] 인자 앞/뒤 공백이 감지되어 자동 제거했습니다: \""
+                        + a + "\" → \"" + trimmed + "\"");
+            }
+            positional.add(trimmed);
         }
 
         String input = positional.get(0);
@@ -1040,33 +1399,56 @@ public class HwpConverter {
 
         // 다건(폴더): 첫 번째 인자가 디렉터리인 경우
         if (inFile.isDirectory()) {
+            int hwp = listByExt(inFile, ".hwp").size();
+            int hwpx = listByExt(inFile, ".hwpx").size();
+            int mdFiles = listByExt(inFile, ".md").size();
+
             String mode = toMode;
             if (mode == null) {
-                int hwp = listByExt(inFile, ".hwp").size();
-                int hwpx = listByExt(inFile, ".hwpx").size();
-                if (hwp > 0 && hwpx == 0) mode = "hwp2hwpx";
-                else if (hwpx > 0 && hwp == 0) mode = "hwpx2hwp";
+                // 자동 판별 (단일 포맷만 있는 경우)
+                if (hwp > 0 && hwpx == 0 && mdFiles == 0) mode = "hwp2hwpx";
+                else if (hwpx > 0 && hwp == 0 && mdFiles == 0) mode = "hwpx2hwp";
                 else {
-                    System.err.println("[오류] 디렉터리 안에 .hwp 와 .hwpx 가 모두 있거나 하나도 없습니다.");
-                    System.err.println("       --to-hwpx 또는 --to-hwp 옵션을 추가하세요.");
+                    System.err.println("[오류] 입력 디렉터리의 포맷을 자동 판별할 수 없습니다.");
+                    System.err.println("       --to-hwpx / --to-hwp / --to-md 옵션을 추가하세요.");
                     System.exit(2);
                     return;
                 }
             }
+
+            // v13.35: .md 파일이 주가 되는 경우 → MD 역변환 분기
+            boolean mdDominant = mdFiles > 0 && hwp == 0 && hwpx == 0;
             BatchResult br;
-            if ("hwp2hwpx".equals(mode)) br = converter.batchHwpToHwpx(input, output);
-            else                          br = converter.batchHwpxToHwp(input, output);
+            if ("any2md".equals(mode)) {
+                br = converter.batchAnyToMd(input, output);
+            } else if ("hwp2hwpx".equals(mode)) {
+                if (mdDominant) br = converter.batchMdToHwpx(input, output);
+                else            br = converter.batchHwpToHwpx(input, output);
+            } else { // "hwpx2hwp"
+                if (mdDominant) br = converter.batchMdToHwp(input, output);
+                else            br = converter.batchHwpxToHwp(input, output);
+            }
             if (br.fail > 0) System.exit(3);
             return;
         }
 
-        // 다건(파일 지정): --to-hwpx/--to-hwp 있고 positional >= 3
+        // 다건(파일 지정): --to-hwpx/--to-hwp/--to-md 있고 positional >= 3
         // → 마지막 positional = 출력 디렉터리, 나머지 = 입력 파일
-        if (toMode != null && positional.size() >= 3) {
+        // v13.35: positional == 2 이고 last positional 이 파일 확장자가 아니면(디렉터리 후보)
+        //         입력 1개 + 출력 디렉터리 1개로 간주해 다건(파일 지정) 경로로 라우팅한다.
+        boolean isMultiFileLayout = toMode != null && (
+                positional.size() >= 3 ||
+                (positional.size() == 2 && !looksLikeOutputFilePath(positional.get(1))));
+        if (isMultiFileLayout) {
             String outDir = positional.get(positional.size() - 1);
             java.util.List<java.io.File> files = new java.util.ArrayList<>();
             for (int i = 0; i < positional.size() - 1; i++) {
                 files.add(new java.io.File(positional.get(i)));
+            }
+            if ("any2md".equals(toMode)) {
+                BatchResult br = converter.batchFilesToMd(files, outDir);
+                if (br.fail > 0) System.exit(3);
+                return;
             }
             String toExt = "hwp2hwpx".equals(toMode) ? ".hwpx" : ".hwp";
             BatchResult br = converter.batchFiles(files, outDir, toExt);
@@ -1074,14 +1456,34 @@ public class HwpConverter {
             return;
         }
 
-        // 단건 (기존 동작)
-        if (input.toLowerCase().endsWith(".hwpx") && output.toLowerCase().endsWith(".hwp")) {
-            converter.convertHwpxToHwp(input, output);
-        } else if (input.toLowerCase().endsWith(".hwp") && output.toLowerCase().endsWith(".hwpx")) {
-            converter.convertHwpToHwpx(input, output);
+        // 단건 (기존 동작) + .md 입출력 라우팅 (v13.16 출력, v13.35 입력 추가)
+        String inLower = input.toLowerCase();
+        String outLower = output.toLowerCase();
+        if (outLower.endsWith(".md")) {
+            // HWP/HWPX → Markdown (HwpMdConverter 위임, 원본 사이드카 자동 저장)
+            HwpMdConverter md = new HwpMdConverter();
+            if (inLower.endsWith(".hwpx")) {
+                md.convertHwpxToMarkdown(input, output);
+            } else if (inLower.endsWith(".hwp")) {
+                md.convertHwpToMarkdown(input, output);
+            } else {
+                System.out.println("Error: .md 출력은 .hwp 또는 .hwpx 입력에서만 지원됩니다.");
+                System.exit(2);
+            }
+        } else if (inLower.endsWith(".md") && outLower.endsWith(".hwp")) {
+            // v13.35: MD → HWP (사이드카 자동 탐지)
+            new HwpMdConverter().convertMarkdownToHwp(input, output);
+        } else if (inLower.endsWith(".md") && outLower.endsWith(".hwpx")) {
+            // v13.35: MD → HWPX (사이드카 자동 탐지)
+            new HwpMdConverter().convertMarkdownToHwpx(input, output);
+        } else if (inLower.endsWith(".hwpx") && outLower.endsWith(".hwp")) {
+            converter.convertHwpxToHwp(input, kr.n.nframe.newfeature.OutputNaming.unique(output));
+        } else if (inLower.endsWith(".hwp") && outLower.endsWith(".hwpx")) {
+            converter.convertHwpToHwpx(input, kr.n.nframe.newfeature.OutputNaming.unique(output));
         } else {
             System.out.println("Error: Cannot determine conversion direction.");
-            System.out.println("  Supported: .hwpx -> .hwp  or  .hwp -> .hwpx  or  --dist");
+            System.out.println("  Supported: .hwpx -> .hwp  or  .hwp -> .hwpx  or  .hwp(x) -> .md  "
+                    + "or  .md -> .hwp(x) (사이드카 필요)  or  --dist");
         }
     }
 
@@ -1089,15 +1491,19 @@ public class HwpConverter {
         System.out.println("Usage (단건):");
         System.out.println("  HwpConverter <input.hwpx> <output.hwp>              (HWPX → HWP)");
         System.out.println("  HwpConverter <input.hwp>  <output.hwpx>             (HWP → HWPX)");
+        System.out.println("  HwpConverter <input.hwp(x)> <output.md>             (HWP/HWPX → MD)");
+        System.out.println("  HwpConverter <input.md> <output.hwp(x)>             (MD → HWP/HWPX, 외부 MD 도 자동 구조 변환)");
         System.out.println("  HwpConverter --dist <input> <output> <password> [--no-copy] [--no-print]");
         System.out.println();
         System.out.println("Usage (다건 - 폴더 전체):");
-        System.out.println("  HwpConverter <inputDir> <outputDir> [--to-hwpx | --to-hwp]");
+        System.out.println("  HwpConverter <inputDir> <outputDir> [--to-hwpx | --to-hwp | --to-md]");
         System.out.println("  HwpConverter --dist <inputDir> <outputDir> <password> [옵션] [--out-hwpx|--out-hwp]");
         System.out.println();
         System.out.println("Usage (다건 - 개별 파일 지정):");
-        System.out.println("  HwpConverter <file1> <file2> ... <outputDir> --to-hwpx|--to-hwp");
+        System.out.println("  HwpConverter <file1> <file2> ... <outputDir> --to-hwpx|--to-hwp|--to-md");
         System.out.println("  HwpConverter --dist <file1> <file2> ... <outputDir> <password> [옵션] [--out-hwpx|--out-hwp]");
+        System.out.println();
+        System.out.println("MD → HWP/HWPX 는 외부 MD 도 구조 변환으로 처리됩니다 (양식은 템플릿 기본값).");
         System.out.println();
         System.out.println("※ 주의: 경로·암호는 반드시 큰따옴표(\")로 감싸고, 여는/닫는 쌍을 맞춰야 합니다.");
         System.out.println("  암호에 < > | & ^ 가 있으면 큰따옴표로 감싸야 cmd 리다이렉션 오류를 피할 수 있습니다.");
